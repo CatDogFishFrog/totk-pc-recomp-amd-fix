@@ -1,6 +1,6 @@
 # TotK Recomp AMD Fix
 
-**TotK Recomp AMD Fix** is an AMD-focused fork of [TotK Recomp](https://github.com/valentderah/totk-pc-recomp), a static recompilation of The Legend of Zelda: Tears of the Kingdom (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux (docs/architecture.md).
+**TotK Recomp AMD Fix** is an AMD-focused fork of [TotK Recomp](https://github.com/valentderah/totk-pc-recomp), a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
 
 > [!IMPORTANT]
 > **No game files are included.** You need your own legally obtained copy of *Tears of the Kingdom*, dumped from your own console: the base game and the 1.1.0, 1.2.1 or 1.4.3 update. Instructions for obtaining those files will not be provided.
@@ -11,6 +11,21 @@
 
 Early development. The game is playable on Windows and Linux; visual bugs and crashes are still expected.
 
+## What this fork adds
+
+Changes on top of upstream TotK Recomp that are not in an upstream release yet:
+
+- **SMAA anti-aliasing** (SMAA 1x) on the finished picture at the game resolution, on any GPU. Turn it on with
+  *Anti-aliasing* on the Screen tab of the menu (F1) or `antialiasing = smaa` in `totk.ini`; it is off by default and
+  a change applies at once. The HUD is smoothed too. Written by [ipavlin98](https://github.com/ipavlin98) (upstream
+  pull request [#624](https://github.com/valentderah/totk-pc-recomp/pull/624)) and carried onto the current `dev` by
+  [itaskaev2](https://github.com/itaskaev2) in [#915](https://github.com/valentderah/totk-pc-recomp/pull/915).
+- **No light fringe around silhouettes against clouds on AMD's Windows drivers** (upstream issue
+  [#164](https://github.com/valentderah/totk-pc-recomp/issues/164)). The game's cloud shader discards a fragment and
+  then reads a texture level of detail; AMD's driver left that undefined for the neighbouring pixels, which lost their
+  fog. A discard now keeps the fragment running as a helper, as it does on the Switch. On by default on AMD's own
+  drivers; other drivers are unchanged. The environment variable `TOTK_DEMOTE=0` or `1` overrides it on any driver.
+
 ## Features
 
 - Native code, not emulation
@@ -18,6 +33,7 @@ Early development. The game is playable on Windows and Linux; visual bugs and cr
 - Takes NSP and XCI game files, and compressed NSZ and XCZ as they are: the setup unpacks them itself
 - 60 fps by default; up to 144 fps or the monitor's refresh rate (experimental)
 - Custom resolutions (1080p, 2k...), supersampling and AMD FSR 1 upscaling
+- SMAA anti-aliasing on any GPU, off by default
 - NVIDIA DLSS / DLAA on RTX GPUs: the setup downloads `nvngx_dlss.dll` from NVIDIA's DLSS SDK repository
   (github.com/NVIDIA/DLSS, NVIDIA RTX SDK license) when it finds an RTX GPU; untick it in the setup to skip it
 - HDR10 output with peak, game and HUD brightness settings
@@ -76,7 +92,7 @@ TotK Recomp builds on the projects below. What was taken from each, with its lic
 - [Ryujinx](https://github.com/Ryujinx/Ryujinx)
 - [deko3d](https://github.com/devkitPro/deko3d)
 - [hactool](https://github.com/SciresM/hactool)
-- [SDL 3](https://libsdl.org), [Dear ImGui](https://github.com/ocornut/imgui), [AMD FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [libopus](https://opus-codec.org), [libvpx](https://chromium.googlesource.com/webm/libvpx), [Zstandard](https://github.com/facebook/zstd)
+- [SDL 3](https://libsdl.org), [Dear ImGui](https://github.com/ocornut/imgui), [AMD FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [SMAA](https://github.com/iryoku/smaa), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [libopus](https://opus-codec.org), [libvpx](https://chromium.googlesource.com/webm/libvpx), [Zstandard](https://github.com/facebook/zstd)
 - [Switchbrew](https://switchbrew.org) and the Switch homebrew community
 
 ## License
