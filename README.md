@@ -1,6 +1,6 @@
-# TotK Recomp
+# TotK Recomp AMD Fix
 
-**TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
+**TotK Recomp AMD Fix** is an AMD-focused fork of [TotK Recomp](https://github.com/valentderah/totk-pc-recomp), a static recompilation of The Legend of Zelda: Tears of the Kingdom (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux (docs/architecture.md).
 
 > [!IMPORTANT]
 > **No game files are included.** You need your own legally obtained copy of *Tears of the Kingdom*, dumped from your own console: the base game and the 1.1.0, 1.2.1 or 1.4.3 update. Instructions for obtaining those files will not be provided.
@@ -10,8 +10,6 @@
 ## Status
 
 Early development. The game is playable on Windows and Linux; visual bugs and crashes are still expected.
-
-Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Features
 
@@ -41,7 +39,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Planned
 
-- VRR
+- FSR4
 
 ## Installing
 
