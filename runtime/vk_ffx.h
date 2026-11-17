@@ -21,7 +21,8 @@ typedef struct {
     VkFfxImage color, depth, mv, reactive, out;   // reactive.image VK_NULL_HANDLE: none
     float jx, jy;               // this frame's jitter, render pixels (window x right, y down), as the scene was drawn
     float dt_ms;                // time since the previous dispatch
-    float cam_near, cam_far;    // view-space distances of the depth range's ends
+    float cam_near, cam_far;    // view-space distances of the near and the far end of the depth range (vk_ffx.c swaps them for
+                                // FSR where the depth is inverted); cam_far is ignored for an infinite far plane
     float fov_y;                // vertical field of view, radians
     float sharpness;            // FSR's own sharpening pass (RCAS) on its output, 0..1; 0: none
     int reset;                  // a new history

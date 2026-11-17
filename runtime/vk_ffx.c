@@ -47,6 +47,7 @@ void vk_ffx_release(void *ctx) { (void)ctx; }
 const char *vk_ffx_version(void) { return ""; }
 #else
 #include <windows.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +68,7 @@ static struct {
     uint64_t version_id;   // 0: the DLL's default
     char version[48];
     float jitter_sign;
+    int camera_plain;   // TOTK_FSR_CAMERA_PLAIN=1: cameraNear/Far as the projection gives them (camera_range)
 } F = {.jitter_sign = 1.0f};
 
 int vk_ffx_wanted(void) {
@@ -139,6 +141,7 @@ void vk_ffx_init(void) {
     F.dev = (VkDeviceContext){c->device, c->phys, vkGetDeviceProcAddr};
     const char *js = cfg_get("TOTK_FSR_JITTER_SIGN");
     if (js && !strcmp(js, "-1")) F.jitter_sign = -1.0f;
+    F.camera_plain = rt_knob("FSR_CAMERA_PLAIN", "0") != 0;
     uint64_t count = FFX_MAX_VERSIONS, ids[FFX_MAX_VERSIONS] = {0};
     const char *names[FFX_MAX_VERSIONS] = {0};
     struct ffxQueryDescGetVersions q = {.header = {FFX_API_QUERY_DESC_TYPE_GET_VERSIONS, NULL},
@@ -262,6 +265,23 @@ static struct FfxApiResource resource(const VkFfxImage *im, uint32_t usage, uint
     return r;
 }
 
+// cameraNear and cameraFar the way the FSR SDK's sample integration hands them over (FidelityFX-SDK, the upscale
+// render module): with depth 1 at the near plane the two swap roles, cameraNear is the far end of the range and
+// cameraFar the near plane, and an infinite far plane is FLT_MAX, not a large finite distance. FSR 3.1 takes the
+// convention from the DEPTH_INVERTED and DEPTH_INFINITE flags, so the order should make no difference to it; FSR 4's
+// signed DLL makes no such statement, and the reference values are the ones it is tested with. TOTK_FSR_CAMERA_PLAIN=1
+// compares against the raw values. near_d and far_d are the distances of the depth range's ends as vk_dlaa.c
+// cam_params reads them (far_d is not used when the far plane is infinite).
+static void camera_range(const struct FfxCtx *fc, float near_d, float far_d, float *cam_near, float *cam_far) {
+    if (F.camera_plain) {
+        *cam_near = near_d, *cam_far = far_d;
+        return;
+    }
+    float far_end = fc->depth_infinite ? FLT_MAX : far_d;
+    if (fc->depth_inverted) *cam_near = far_end, *cam_far = near_d;
+    else *cam_near = near_d, *cam_far = far_end;
+}
+
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
     struct FfxCtx *fc = ctx;
     if (!fc || !fc->ctx) return 0;
@@ -289,8 +309,7 @@ int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
     u.frameTimeDelta = d->dt_ms;
     u.preExposure = 1.0f;
     u.reset = d->reset != 0;
-    u.cameraNear = d->cam_near;
-    u.cameraFar = d->cam_far;
+    camera_range(fc, d->cam_near, d->cam_far, &u.cameraNear, &u.cameraFar);
     u.cameraFovAngleVertical = d->fov_y;
     u.viewSpaceToMetersFactor = 1.0f;   // TotK's world units are metres
     ffxReturnCode_t r = F.dispatch(&c, &u.header);
