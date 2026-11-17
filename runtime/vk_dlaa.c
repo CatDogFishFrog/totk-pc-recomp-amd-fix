@@ -293,7 +293,7 @@ static struct {
     int ended, up;               // this frame: the scene is drawn (jitter over), DLSS wrote the scaled output
     uint64_t end_fence;          // a chunked replay: the submission and op the scan ended the scene at (ended_at)
     uint32_t end_pos;
-    struct Size {                // a DLSS feature and its work images per scene size (dynamic resolution flips it)
+    struct Size {                // a DLSS feature and the work images per scene size (dynamic resolution flips it)
         uint32_t w, h, ow, oh;   // render size, output size
         VkImage out, mv;
         VmaAllocation out_mem, mv_mem;
@@ -302,11 +302,15 @@ static struct {
         VmaAllocation mask_mem, chars_mem[2];
         VkImageView mask_view, chars_view[2];
         int chars_cur, chars_ok; // chars[chars_cur] is written next; chars_ok: the other holds last frame's
-        NgxHandle *feat;
-        void *ffx;               // the FSR context instead (fsr_backend)
-        int ffx_diff;            // frames in a row the camera's depth convention differed from the context's
+        NgxHandle *feat;         // DLSS only: FSR's one context is D.fx, whatever the size
         uint64_t used;           // evals count when it last ran
     } sizes[5], *last;           // last: the one the previous DLAA frame ran with
+    struct {                     // the FSR context (fsr_backend): one for every scene size, see fsr_context
+        void *ctx;
+        uint32_t ow, oh;         // the output size it was made for, and the largest scene it was made to take:
+        uint32_t mw, mh;         // kept after it is released, as the next one for that output starts from them
+        int diff;                // frames in a row the camera's depth convention differed from the context's
+    } fx;
     VkImage last_color;          // the target DLAA ran on last frame: another one means a new history
     NgxParam *params;
     int failed, reset;
@@ -343,7 +347,7 @@ static struct {
     uint64_t last_eval_ns;       // plat_now_ns of the previous evaluation (FrameTimeDeltaInMsec)
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
 #define DLSS_SIZES (sizeof D.sizes / sizeof D.sizes[0])
-// FSR fixes the depth convention (inverted, infinite far plane) when a context is created. A context is replaced once
+// FSR fixes the depth convention (inverted, infinite far plane) when a context is created. The context is replaced once
 // the camera has shown another convention for this many DLAA frames in a row: the title screen and the game differ
 // and the change stays, while one odd frame must not cost a context (FSR 4 contexts are expensive to create).
 #define FFX_DEPTH_SETTLE 3
@@ -388,14 +392,13 @@ static void free_size(struct Size *e) {
         if (e->chars[i]) vmaDestroyImage(c->vma, e->chars[i], e->chars_mem[i]);
     }
     if (e->feat) N.release(e->feat);
-    if (e->ffx) vk_ffx_release(e->ffx);
     memset(e, 0, sizeof *e);
 }
 
 // The entry for a scene and output size: its output (RGBA16F at the output size, written by DLSS, then blitted into
 // the target) and motion vectors (RG16F at the scene size, render pixels), both kept in GENERAL like every image of the
-// back end. TotK's dynamic resolution switches between a few sizes; each keeps its feature, the least recently used
-// goes for a new one.
+// back end. TotK's dynamic resolution switches between a few sizes; each keeps its images and DLSS feature, the least
+// recently used goes for a new one. FSR's context is not part of an entry (fsr_context).
 static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     struct Size *e = NULL, *lru = &D.sizes[0];
     for (int i = 0; i < 5; i++) {
@@ -1016,9 +1019,9 @@ static int scene_shaped(const VkExecTarget *c) {
 // 1 / tan(fov / 2). A frame whose block does not have that shape (or has no camera block) reuses the last camera that
 // did: FSR's contexts are created with the depth flags, and the first run (1.4.3 at the title screen, RX 9070 XT) read
 // 0.1 m to 1001 m, 45 degrees, depth not inverted, while later contexts of the dynamic resolution's other sizes got the
-// defaults and inverted, infinite depth. evaluate therefore compares the flags with each context's (vk_ffx_depth_matches)
-// every frame and replaces a context made for the other convention. Before any camera was read the defaults are 0.1 m
-// to 1000 m, 50 degrees, depth not inverted. The first read and the first miss are logged, each once.
+// defaults and inverted, infinite depth. fsr_context therefore compares the flags with the context's
+// (vk_ffx_depth_matches) every frame and replaces a context made for the other convention. Before any camera was
+// read the defaults are 0.1 m to 1000 m, 50 degrees, depth not inverted. The first read and the first miss are logged, each once.
 static void cam_params(float *cn, float *cf, float *fov, int *inv, int *inf) {
     static struct { int ok; float cn, cf, fov; int inv, inf; } last = {0, 0.1f, 1000.0f, 0.8727f, 0, 0};
     *cn = last.cn, *cf = last.cf, *fov = last.fov, *inv = last.inv, *inf = last.inf;
@@ -1060,6 +1063,42 @@ static void cam_params(float *cn, float *cf, float *fov, int *inv, int *inf) {
     }
 }
 
+// The FSR context for this frame's scene, NULL when one cannot be made. A single context serves every scene size of the
+// run: it is created with the dynamic resolution flag and a largest render size, and every dispatch names the render
+// size of its own images (vk_ffx_create), so the game's dynamic resolution, a DLSS mode change or any other new scene
+// size neither costs a context (a FSR 4 context holds hundreds of MiB and takes a while to create) nor throws FSR's
+// history away. The largest render size is the largest scene seen for this output: FSR sizes its internal render-size
+// images by it, so a scene that stays at 50 % of the output does not pay for 100 %, and a larger one later costs one
+// new context, after which the maximum holds. The context is replaced, with a new history, when
+//  - the output size changed, or a scene larger than the maximum appeared (vk_ffx_fits); or
+//  - the camera's depth convention, a creation flag, has differed for FFX_DEPTH_SETTLE frames in a row: the title
+//    screen and the game project depth differently (cam_params). The maximum stays.
+static void *fsr_context(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int inv, int inf) {
+    void *c = D.fx.ctx;
+    const char *why = NULL;
+    if (c && !vk_ffx_fits(c, w, h, ow, oh)) {
+        why = "the scene or output size outgrew it";
+    } else if (c && !vk_ffx_depth_matches(c, inv, inf)) {
+        if (++D.fx.diff >= FFX_DEPTH_SETTLE) why = "the depth convention changed";
+    } else {
+        D.fx.diff = 0;
+    }
+    if (why) {
+        rt_log("fsr: %s (scene %ux%u, output %ux%u, inverted %d, infinite %d): new context", why, w, h, ow, oh, inv, inf);
+        vkDeviceWaitIdle(vk_ctx()->device);   // earlier frames still use the context
+        vk_ffx_release(c);
+        c = D.fx.ctx = NULL;
+    }
+    if (!c) {
+        uint32_t mw = w, mh = h;   // for a new output, this scene; for the same one, no smaller than before
+        if (D.fx.ow == ow && D.fx.oh == oh) mw = mw > D.fx.mw ? mw : D.fx.mw, mh = mh > D.fx.mh ? mh : D.fx.mh;
+        c = D.fx.ctx = vk_ffx_create(mw, mh, ow, oh, inv, inf);
+        D.fx.diff = 0;
+        if (c) D.fx.ow = ow, D.fx.oh = oh, D.fx.mw = mw, D.fx.mh = mh, D.reset = 1;
+    }
+    return c;
+}
+
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
 static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     const VkExecTarget *t = &D.color, *z = &D.depth;
@@ -1074,8 +1113,13 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     }
     struct Size *e = size_for(cb, w, h, ow, oh);
     if (!e) return dl_fail("work image creation", 0);
-    if (e != D.last) D.reset = 1, D.why[0]++, e->chars_ok = 0;   // another size's history is from another moment
     int fsr = fsr_backend();
+    if (e != D.last) {
+        e->chars_ok = 0;   // another size's character history is from another moment
+        // A DLSS feature belongs to one scene size, so DLSS starts a new history here; FSR's one context takes the new
+        // render size at its dispatch and keeps its history (a target the game made anew still resets it below).
+        if (!fsr) D.reset = 1, D.why[0]++;
+    }
     // FSR is handed whole images, not views: the light target and the depth must be their image's first level and layer
     if (fsr && (t->level || t->base_layer || z->level || z->base_layer))
         return dl_fail("FSR input (the scene targets are not level 0, layer 0 of their images)", 0);
@@ -1112,25 +1156,8 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         float cn, cf, fov;
         int inv, inf;
         cam_params(&cn, &cf, &fov, &inv, &inf);
-        // The depth convention is a creation flag of the context, and the game changes it (title screen and game
-        // have different projections, cam_params): a context made for the other one is replaced, with a new history.
-        if (e->ffx && !vk_ffx_depth_matches(e->ffx, inv, inf)) {
-            if (++e->ffx_diff >= FFX_DEPTH_SETTLE) {
-                rt_log("fsr: depth convention changed at %ux%u -> %ux%u (inverted %d, infinite %d): new context", w, h,
-                       ow, oh, inv, inf);
-                vkDeviceWaitIdle(vk_ctx()->device);   // earlier frames still use the context
-                vk_ffx_release(e->ffx);
-                e->ffx = NULL;
-            }
-        } else {
-            e->ffx_diff = 0;
-        }
-        if (!e->ffx) {
-            e->ffx = vk_ffx_create(w, h, ow, oh, inv, inf);
-            if (!e->ffx) return dl_fail("FSR context creation", 0);
-            e->ffx_diff = 0;
-            D.reset = 1;
-        }
+        void *fx = fsr_context(w, h, ow, oh, inv, inf);   // a new one starts a new history (D.reset)
+        if (!fx) return dl_fail("FSR context creation", 0);
         if (D.last_color != t->image) D.reset = 1, D.why[2]++, D.last_color = t->image;
         // FSR sharpens its own output (sharpness, the setting the FSR 1 present pass reads too): the game's sharpening
         // is part of its FXAA pass, which FSR's frames go without (vk_dlaa_skip_draw).
@@ -1145,7 +1172,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         if (mk) fd.reactive = (VkFfxImage){mk->mask, VK_FORMAT_R8_UNORM, w, h};
         else if (masked) fd.reactive = (VkFfxImage){e->mask, VK_FORMAT_R8_UNORM, w, h};
         c0 = timed ? kern_now_ns() : 0;
-        int ok = vk_ffx_dispatch(e->ffx, cb, &fd);
+        int ok = vk_ffx_dispatch(fx, cb, &fd);
         if (timed) T.cpu_ngx += kern_now_ns() - c0;
         if (!ok) return dl_fail("FSR dispatch", 0);
         goto upscaled;   // the copy of the result and what follows are the same as DLSS's
@@ -1397,18 +1424,19 @@ void vk_dlaa_pass(VkExec *ex) {
 }
 
 // TOTK_DLSS, read at each present (the menu switches it live): the scene size of the mode (resolution.c) and the
-// texture bias that goes with it while DLSS runs.
+// texture bias that goes with it while DLSS or FSR runs. The two ask for different biases: DLSS log2(scene / output),
+// FSR one level more (res_fsr_lod_bias), and FSR's applies at native size as well. The bias is looked up every frame, as
+// the scene size a mode change sets moves it; the samplers are only touched when it differs from the one in force.
 static void dlss_mode(void) {
     static char mode[32];
-    static int bias_on = -1;
+    static float bias;   // what the samplers were last given; they start with none
     const char *m = cfg_value("TOTK_DLSS");
     if (strcmp(m, mode)) {
         snprintf(mode, sizeof mode, "%s", m);
         res_dlss_mode(m);
-        bias_on = -1;
     }
-    int b = dl_active();
-    if (b != bias_on) bias_on = b, vk_sampler_dlss_bias(b ? res_dlss_lod_bias() : 0.0f);
+    float b = !dl_active() ? 0.0f : fsr_backend() ? res_fsr_lod_bias() : res_dlss_lod_bias();
+    if (b != bias) bias = b, vk_sampler_dlss_bias(b);
 }
 
 

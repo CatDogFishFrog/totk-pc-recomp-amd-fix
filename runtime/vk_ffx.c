@@ -13,6 +13,13 @@
 // FSR's own convention as well: its guide derives the projection offset as (2 jx / w, -2 jy / h), which moves the
 // picture by (jx, jy) window pixels with y down, the way vk_dlaa_viewport moves the viewport. TOTK_FSR_JITTER_SIGN=-1
 // flips it to test the other convention.
+//
+// One context serves every scene size of a run (vk_ffx_create): it is created with the dynamic resolution flag
+// (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION) and the largest render size expected, and each dispatch states the size of
+// its own images (renderSize). The input
+// images are exactly render-sized, so the region of them the upscaler reads is the whole image; FSR 3.1 reads its
+// inputs by integer load or by the input's own size (ffx_fsr3upscaler_callbacks_hlsl.h, prepare_inputs, upsample) and
+// keeps its internal images at maxRenderSize.
 #include "vk_ffx.h"
 
 #include "cfg.h"
@@ -25,9 +32,12 @@ void vk_ffx_device_exts(const VkExtensionProperties *have, uint32_t nhave, const
 }
 void vk_ffx_init(void) {}
 int vk_ffx_available(void) { return 0; }
-void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
-    (void)w, (void)h, (void)ow, (void)oh, (void)depth_inverted, (void)depth_infinite;
+void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
+    (void)max_w, (void)max_h, (void)ow, (void)oh, (void)depth_inverted, (void)depth_infinite;
     return NULL;
+}
+int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    return (void)ctx, (void)w, (void)h, (void)ow, (void)oh, 0;
 }
 int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite) {
     return (void)ctx, (void)depth_inverted, (void)depth_infinite, 1;
@@ -65,10 +75,12 @@ int vk_ffx_wanted(void) {
     return wanted;
 }
 
-// What vk_ffx_create hands out: the ffx context and the depth convention it was created with. The convention is part of
-// the context's creation flags and cannot change afterwards, so it is kept here for vk_ffx_depth_matches.
+// What vk_ffx_create hands out: the ffx context, the sizes it was created for and the depth convention. All of them are
+// part of the context's creation (maxRenderSize, maxUpscaleSize, the depth flags) and cannot change afterwards, so they
+// are kept here for vk_ffx_fits and vk_ffx_depth_matches.
 struct FfxCtx {
     ffxContext ctx;
+    uint32_t max_w, max_h, ow, oh;
     int depth_inverted, depth_infinite;
 };
 
@@ -172,7 +184,7 @@ static void on_message(uint32_t type, const wchar_t *msg) {
     rt_log("fsr: %s: %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", s);
 }
 
-void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
+void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
     if (!F.available) return NULL;
     struct ffxOverrideVersion ov = {.header = {FFX_API_DESC_TYPE_OVERRIDE_VERSION, NULL}, .versionId = F.version_id};
     struct ffxCreateContextDescUpscaleVersion ver = {
@@ -180,28 +192,36 @@ void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_
         .version = FFX_UPSCALER_VERSION};
     struct ffxCreateBackendVKDesc be = {.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, &ver.header},
                                         .deviceContext = F.dev};
-    // Linear HDR scene light with the upscaler's own exposure, as DLSS gets it ("IsHDR | AutoExposure")
-    uint32_t flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    // Linear HDR scene light with the upscaler's own exposure, as DLSS gets it ("IsHDR | AutoExposure"). The render
+    // size is named at every dispatch (DYNAMIC_RESOLUTION): one context serves every scene size up to maxRenderSize.
+    uint32_t flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+                     FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
     if (depth_inverted) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     if (depth_infinite) flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     if (rt_knob("FSR_DEBUG", "0")) flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;   // TOTK_FSR_DEBUG=1: API checks
     struct ffxCreateContextDescUpscale cd = {.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &be.header},
-                                             .flags = flags, .maxRenderSize = {w, h}, .maxUpscaleSize = {ow, oh},
-                                             .fpMessage = on_message};
+                                             .flags = flags, .maxRenderSize = {max_w, max_h},
+                                             .maxUpscaleSize = {ow, oh}, .fpMessage = on_message};
     struct FfxCtx *fc = calloc(1, sizeof *fc);
     if (!fc) return NULL;
     ffxReturnCode_t r = F.create(&fc->ctx, &cd.header, NULL);
     if (r != FFX_API_RETURN_OK || !fc->ctx) {
-        rt_log("fsr: context creation failed (%u) at %ux%u -> %ux%u", (unsigned)r, w, h, ow, oh);
+        rt_log("fsr: context creation failed (%u) for up to %ux%u -> %ux%u", (unsigned)r, max_w, max_h, ow, oh);
         free(fc);
         return NULL;
     }
+    fc->max_w = max_w, fc->max_h = max_h, fc->ow = ow, fc->oh = oh;
     fc->depth_inverted = depth_inverted != 0, fc->depth_infinite = depth_infinite != 0;
     struct ffxQueryGetProviderVersion pv = {.header = {FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, NULL}};
     F.query(&fc->ctx, &pv.header);
-    rt_log("fsr: context created at %ux%u -> %ux%u with %s (flags %#x)", w, h, ow, oh,
+    rt_log("fsr: context created for scenes up to %ux%u -> %ux%u with %s (flags %#x)", max_w, max_h, ow, oh,
            pv.versionName ? pv.versionName : F.version, flags);
     return fc;
+}
+
+int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    const struct FfxCtx *fc = ctx;
+    return fc && fc->ctx && fc->ow == ow && fc->oh == oh && w <= fc->max_w && h <= fc->max_h;
 }
 
 int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite) {
@@ -245,6 +265,11 @@ static struct FfxApiResource resource(const VkFfxImage *im, uint32_t usage, uint
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
     struct FfxCtx *fc = ctx;
     if (!fc || !fc->ctx) return 0;
+    if (!vk_ffx_fits(fc, d->color.width, d->color.height, d->out.width, d->out.height)) {
+        rt_log("fsr: dispatch %ux%u -> %ux%u is outside the context (up to %ux%u -> %ux%u)", d->color.width,
+               d->color.height, d->out.width, d->out.height, fc->max_w, fc->max_h, fc->ow, fc->oh);
+        return 0;
+    }
     ffxContext c = fc->ctx;
     struct ffxDispatchDescUpscale u;
     memset(&u, 0, sizeof u);

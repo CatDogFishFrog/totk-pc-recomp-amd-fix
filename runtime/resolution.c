@@ -625,6 +625,20 @@ float res_dlss_lod_bias(void) {
     return R.dlss_k ? (float)log2(R.dlss_k) : 0.0f;
 }
 
+// AMD FSR upscaling: AMD asks for log2(render / display) - 1.0 (FidelityFX SDK 2.4, the upscaler guides' "Mipmap
+// biasing": -1.58 at Quality, -2.0 at Performance), a whole level sharper than DLSS's log2(render / output), because
+// the temporal upscaler resolves the extra texture detail. The display is what FSR writes: the output, or the scene
+// itself when it is as large as the output (FSR then works in place at the scene's size), so the ratio is the scene's
+// width over the output's and at most 1, and it comes from the scene size in effect, which also holds for the game's
+// own 5/6 and for render_scale. Native-size FSR (a ratio of 1) gets -1.0. The sampler clamps to the device's
+// maxSamplerLodBias (vk_texture.c make_sampler).
+float res_fsr_lod_bias(void) {
+    unsigned o[2], s[2];
+    res_sizes(o, s);
+    double k = (double)s[0] / o[0];
+    return (float)(log2(k > 1.0 ? 1.0 : k) - 1.0);
+}
+
 // 16:9 within 1% (1366x768 counts): the shape the game's own layouts and camera are made for.
 int res_is_16x9(unsigned w, unsigned h) {
     double rel = ((double)w / h) / ((double)BASE_W / BASE_H);

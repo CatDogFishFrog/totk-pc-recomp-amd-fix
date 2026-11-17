@@ -27,11 +27,19 @@ typedef struct {
     int reset;                  // a new history
 } VkFfxDispatch;
 
-// A context for one render and output size (vk_dlaa.c keeps one per scene size like DLSS's features). depth_inverted:
-// depth 1 is near; depth_infinite: the far plane is at infinity. Both are creation flags of the upscaler and stay fixed
-// for the life of the context: when the game's depth convention changes, the context has to be released and a new one
-// created (vk_ffx_depth_matches tells). NULL on failure (logged).
-void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite);
+// A context for one output size that renders at any scene size up to max_w x max_h: it is created with the upscaler's
+// dynamic resolution flag, and every dispatch names the render size of its own images, so one context (and one FSR
+// history, and one working set of memory) serves all the scene sizes of a run. The upscaler sizes its internal
+// render-size images by the maximum, so it should be the largest scene expected, not the output. vk_dlaa.c keeps a
+// single context and replaces it only where vk_ffx_fits says it no longer serves. depth_inverted: depth 1 is near;
+// depth_infinite: the far plane is at infinity. Both are creation flags of the upscaler and stay fixed for the life of
+// the context: when the game's depth convention changes, the context has to be released and a new one created
+// (vk_ffx_depth_matches tells).
+// NULL on failure (logged).
+void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite);
+// 1 when ctx can upscale a w x h scene to ow x oh: the output size is the one it was made for and the scene is within
+// its largest render size. 0 for a NULL ctx.
+int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh);
 // 1 when ctx was created with this depth convention (also for a NULL ctx, which has none to disagree).
 int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite);
 // Records the upscaling into cb. 0 on failure (logged). FSR binds pipelines and descriptors of its own.
