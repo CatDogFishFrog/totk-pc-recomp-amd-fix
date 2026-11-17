@@ -142,7 +142,10 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   start the upscaler's versions for the device are listed and the newest FSR 4 is pinned where the DLL offers it (the
   DLL decides which GPUs get it), else its default (FSR 3.1). `vk_device.c` enables `VK_KHR_cooperative_matrix` and
   `VK_EXT_shader_float8` with their features when the device has them. FSR also asks for the camera's near and far
-  distances and field of view, which `cam_params` reads from the projection in the scene camera block.
+  distances and field of view, which `cam_params` reads from the projection in the scene camera block, and the depth
+  convention (inverted, infinite far plane), which an FSR context fixes at creation: `evaluate` compares it with each
+  context's every frame (`vk_ffx_depth_matches`) and replaces a context made for another convention once the camera has
+  shown the new one for a few frames in a row, because the title screen and the game project depth differently.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
 - ASTC textures are uploaded as they are where the device reports `textureCompressionASTC_LDR`, and decoded by a compute shader everywhere else (`vk_astc.c`, `TOTK_ASTC`). The CPU decoder (`tex_astc*.c`) is the fallback and the test oracle.
 - Draw state. A draw whose program, bound state and textures repeat reuses the previous draw's shaders and skips rebuilding its descriptor sets; descriptor sets are written through update templates (`vk_exec_draw.c`, `vk_pipeline.c`).

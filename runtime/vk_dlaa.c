@@ -304,6 +304,7 @@ static struct {
         int chars_cur, chars_ok; // chars[chars_cur] is written next; chars_ok: the other holds last frame's
         NgxHandle *feat;
         void *ffx;               // the FSR context instead (fsr_backend)
+        int ffx_diff;            // frames in a row the camera's depth convention differed from the context's
         uint64_t used;           // evals count when it last ran
     } sizes[5], *last;           // last: the one the previous DLAA frame ran with
     VkImage last_color;          // the target DLAA ran on last frame: another one means a new history
@@ -342,6 +343,10 @@ static struct {
     uint64_t last_eval_ns;       // plat_now_ns of the previous evaluation (FrameTimeDeltaInMsec)
 } D = {.mv_ok = -1, .cfg_seen = ~0u};
 #define DLSS_SIZES (sizeof D.sizes / sizeof D.sizes[0])
+// FSR fixes the depth convention (inverted, infinite far plane) when a context is created. A context is replaced once
+// the camera has shown another convention for this many DLAA frames in a row: the title screen and the game differ
+// and the change stays, while one odd frame must not cost a context (FSR 4 contexts are expensive to create).
+#define FFX_DEPTH_SETTLE 3
 
 const VkTexImage *vk_dlaa_swap_img;
 VkImageView vk_dlaa_swap_view;
@@ -1011,8 +1016,9 @@ static int scene_shaped(const VkExecTarget *c) {
 // 1 / tan(fov / 2). A frame whose block does not have that shape (or has no camera block) reuses the last camera that
 // did: FSR's contexts are created with the depth flags, and the first run (1.4.3 at the title screen, RX 9070 XT) read
 // 0.1 m to 1001 m, 45 degrees, depth not inverted, while later contexts of the dynamic resolution's other sizes got the
-// defaults and inverted, infinite depth. Before any camera was read the defaults are 0.1 m to 1000 m, 50 degrees, depth
-// not inverted. The first read and the first miss are logged, each once.
+// defaults and inverted, infinite depth. evaluate therefore compares the flags with each context's (vk_ffx_depth_matches)
+// every frame and replaces a context made for the other convention. Before any camera was read the defaults are 0.1 m
+// to 1000 m, 50 degrees, depth not inverted. The first read and the first miss are logged, each once.
 static void cam_params(float *cn, float *cf, float *fov, int *inv, int *inf) {
     static struct { int ok; float cn, cf, fov; int inv, inf; } last = {0, 0.1f, 1000.0f, 0.8727f, 0, 0};
     *cn = last.cn, *cf = last.cf, *fov = last.fov, *inv = last.inv, *inf = last.inf;
@@ -1106,9 +1112,23 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         float cn, cf, fov;
         int inv, inf;
         cam_params(&cn, &cf, &fov, &inv, &inf);
+        // The depth convention is a creation flag of the context, and the game changes it (title screen and game
+        // have different projections, cam_params): a context made for the other one is replaced, with a new history.
+        if (e->ffx && !vk_ffx_depth_matches(e->ffx, inv, inf)) {
+            if (++e->ffx_diff >= FFX_DEPTH_SETTLE) {
+                rt_log("fsr: depth convention changed at %ux%u -> %ux%u (inverted %d, infinite %d): new context", w, h,
+                       ow, oh, inv, inf);
+                vkDeviceWaitIdle(vk_ctx()->device);   // earlier frames still use the context
+                vk_ffx_release(e->ffx);
+                e->ffx = NULL;
+            }
+        } else {
+            e->ffx_diff = 0;
+        }
         if (!e->ffx) {
             e->ffx = vk_ffx_create(w, h, ow, oh, inv, inf);
             if (!e->ffx) return dl_fail("FSR context creation", 0);
+            e->ffx_diff = 0;
             D.reset = 1;
         }
         if (D.last_color != t->image) D.reset = 1, D.why[2]++, D.last_color = t->image;

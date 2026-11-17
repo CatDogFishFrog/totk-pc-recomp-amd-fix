@@ -28,8 +28,12 @@ typedef struct {
 } VkFfxDispatch;
 
 // A context for one render and output size (vk_dlaa.c keeps one per scene size like DLSS's features). depth_inverted:
-// depth 1 is near; depth_infinite: the far plane is at infinity. NULL on failure (logged).
+// depth 1 is near; depth_infinite: the far plane is at infinity. Both are creation flags of the upscaler and stay fixed
+// for the life of the context: when the game's depth convention changes, the context has to be released and a new one
+// created (vk_ffx_depth_matches tells). NULL on failure (logged).
 void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite);
+// 1 when ctx was created with this depth convention (also for a NULL ctx, which has none to disagree).
+int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite);
 // Records the upscaling into cb. 0 on failure (logged). FSR binds pipelines and descriptors of its own.
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d);
 void vk_ffx_release(void *ctx);

@@ -29,6 +29,9 @@ void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_
     (void)w, (void)h, (void)ow, (void)oh, (void)depth_inverted, (void)depth_infinite;
     return NULL;
 }
+int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite) {
+    return (void)ctx, (void)depth_inverted, (void)depth_infinite, 1;
+}
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) { return (void)ctx, (void)cb, (void)d, 0; }
 void vk_ffx_release(void *ctx) { (void)ctx; }
 const char *vk_ffx_version(void) { return ""; }
@@ -61,6 +64,13 @@ int vk_ffx_wanted(void) {
     if (wanted < 0) wanted = cfg_bool("TOTK_DLAA") && !strcmp(cfg_value("TOTK_DLAA_BACKEND"), "fsr");
     return wanted;
 }
+
+// What vk_ffx_create hands out: the ffx context and the depth convention it was created with. The convention is part of
+// the context's creation flags and cannot change afterwards, so it is kept here for vk_ffx_depth_matches.
+struct FfxCtx {
+    ffxContext ctx;
+    int depth_inverted, depth_infinite;
+};
 
 static int loader_load(void) {
     if (F.tried) return F.loaded;
@@ -178,23 +188,32 @@ void *vk_ffx_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int depth_
     struct ffxCreateContextDescUpscale cd = {.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &be.header},
                                              .flags = flags, .maxRenderSize = {w, h}, .maxUpscaleSize = {ow, oh},
                                              .fpMessage = on_message};
-    ffxContext ctx = NULL;
-    ffxReturnCode_t r = F.create(&ctx, &cd.header, NULL);
-    if (r != FFX_API_RETURN_OK || !ctx) {
+    struct FfxCtx *fc = calloc(1, sizeof *fc);
+    if (!fc) return NULL;
+    ffxReturnCode_t r = F.create(&fc->ctx, &cd.header, NULL);
+    if (r != FFX_API_RETURN_OK || !fc->ctx) {
         rt_log("fsr: context creation failed (%u) at %ux%u -> %ux%u", (unsigned)r, w, h, ow, oh);
+        free(fc);
         return NULL;
     }
+    fc->depth_inverted = depth_inverted != 0, fc->depth_infinite = depth_infinite != 0;
     struct ffxQueryGetProviderVersion pv = {.header = {FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, NULL}};
-    F.query(&ctx, &pv.header);
+    F.query(&fc->ctx, &pv.header);
     rt_log("fsr: context created at %ux%u -> %ux%u with %s (flags %#x)", w, h, ow, oh,
            pv.versionName ? pv.versionName : F.version, flags);
-    return ctx;
+    return fc;
+}
+
+int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite) {
+    const struct FfxCtx *fc = ctx;
+    return !fc || (fc->depth_inverted == (depth_inverted != 0) && fc->depth_infinite == (depth_infinite != 0));
 }
 
 void vk_ffx_release(void *ctx) {
-    if (!ctx) return;
-    ffxContext c = ctx;
-    F.destroy(&c, NULL);
+    struct FfxCtx *fc = ctx;
+    if (!fc) return;
+    if (fc->ctx) F.destroy(&fc->ctx, NULL);
+    free(fc);
 }
 
 static uint32_t surface_format(VkFormat f) {
@@ -224,8 +243,9 @@ static struct FfxApiResource resource(const VkFfxImage *im, uint32_t usage, uint
 }
 
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
-    if (!ctx) return 0;
-    ffxContext c = ctx;
+    struct FfxCtx *fc = ctx;
+    if (!fc || !fc->ctx) return 0;
+    ffxContext c = fc->ctx;
     struct ffxDispatchDescUpscale u;
     memset(&u, 0, sizeof u);
     u.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
