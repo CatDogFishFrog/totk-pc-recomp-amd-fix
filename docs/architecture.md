@@ -154,6 +154,13 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   resolution) keeps FSR's history and neither costs a context nor holds one more working set of memory. It is replaced
   only when the output size changes or a scene larger than its maximum appears (`vk_ffx_fits`). Textures are sampled at AMD's mip bias for FSR, `log2(scene / output) - 1` (`res_fsr_lod_bias`,
   -1 at native size), one level sharper than DLSS's.
+  The scene's share for each mode is FSR's own ratio (1.5, 1.7, 2.0, 3.0:1; only Balanced differs from DLSS's, 1/1.7 against
+  0.58). After creating a context `vk_ffx.c` asks the upscaler which inputs it requires or takes
+  (`ffxQueryDescUpscaleGetResourceRequirements`): where the reactive mask is not among them `vk_dlaa.c` skips the class
+  mask, the reactive mask pass and its copy of the light target (`reactive_wanted`), and the reactive and the transparency
+  and composition mask are handed over only where the context takes them. `ffxConfigure` sets FSR 3.1's constants from
+  the `fsr_velocity_factor`, `fsr_reactiveness_scale`, `fsr_shading_change_scale`, `fsr_accumulation` and
+  `fsr_min_disocclusion` settings when they are set.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
 - ASTC textures are uploaded as they are where the device reports `textureCompressionASTC_LDR`, and decoded by a compute shader everywhere else (`vk_astc.c`, `TOTK_ASTC`). The CPU decoder (`tex_astc*.c`) is the fallback and the test oracle.
 - Draw state. A draw whose program, bound state and textures repeat reuses the previous draw's shaders and skips rebuilding its descriptor sets; descriptor sets are written through update templates (`vk_exec_draw.c`, `vk_pipeline.c`).

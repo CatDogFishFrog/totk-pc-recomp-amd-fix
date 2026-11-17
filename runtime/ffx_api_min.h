@@ -1,5 +1,6 @@
 // The part of AMD's FSR API (ffx-api) that vk_ffx.c uses: the entry points of amd_fidelityfx_loader_vk.dll, the
-// Vulkan backend descriptor and the upscaler's create and dispatch descriptors. Copied from the FidelityFX SDK v2.4.0
+// Vulkan backend descriptor and the upscaler's create, dispatch, configure and resource requirement descriptors.
+// Copied from the FidelityFX SDK v2.4.0
 // (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, Kits/FidelityFX/api/include/ffx_api.h, ffx_api_types.h, vk/ffx_api_vk.h
 // and Kits/FidelityFX/upscalers/include/ffx_upscale.h), trimmed to those declarations; the layouts and values are
 // unchanged. The SDK's headers use a C++ attribute for deprecations, so they are not included as they are.
@@ -91,6 +92,7 @@ typedef struct ffxAllocationCallbacks ffxAllocationCallbacks;
 typedef ffxReturnCode_t (*PfnFfxCreateContext)(ffxContext *context, ffxCreateContextDescHeader *desc,
                                                const ffxAllocationCallbacks *memCb);
 typedef ffxReturnCode_t (*PfnFfxDestroyContext)(ffxContext *context, const ffxAllocationCallbacks *memCb);
+typedef ffxReturnCode_t (*PfnFfxConfigure)(ffxContext *context, const ffxConfigureDescHeader *desc);
 typedef ffxReturnCode_t (*PfnFfxQuery)(ffxContext *context, ffxQueryDescHeader *desc);
 typedef ffxReturnCode_t (*PfnFfxDispatch)(ffxContext *context, const ffxDispatchDescHeader *desc);
 
@@ -242,4 +244,39 @@ struct ffxDispatchDescUpscale {
 struct ffxCreateContextDescUpscaleVersion {
     ffxCreateContextDescHeader header;
     uint32_t version;   // FFX_UPSCALER_VERSION
+};
+
+// Constants of the FSR 3.1 upscaler that ffxConfigure overrides (ffxConfigureDescUpscaleKeyValue). ptr points at a
+// float; a NULL ptr restores the default.
+#define FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_UPSCALE, 0x07)
+struct ffxConfigureDescUpscaleKeyValue {
+    ffxConfigureDescHeader header;
+    uint64_t key;   // FfxApiConfigureUpscaleKey
+    uint64_t u64;
+    void *ptr;
+};
+
+enum FfxApiConfigureUpscaleKey {
+    FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR = 0,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE = 1,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE = 2,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME = 3,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION = 4,
+};
+
+// The inputs a context consumes, given how it was created: ffxQuery with this descriptor on the context.
+enum FfxApiQueryResourceIdentifiers {
+    FFX_API_QUERY_RESOURCE_INPUT_COLOR = (1 << 0),
+    FFX_API_QUERY_RESOURCE_INPUT_DEPTH = (1 << 1),
+    FFX_API_QUERY_RESOURCE_INPUT_MV = (1 << 2),
+    FFX_API_QUERY_RESOURCE_INPUT_EXPOSURE = (1 << 3),
+    FFX_API_QUERY_RESOURCE_INPUT_REACTIVEMASK = (1 << 4),
+    FFX_API_QUERY_RESOURCE_INPUT_TRANSPARENCYCOMPOSITION = (1 << 5),
+};
+
+#define FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_UPSCALE, 0x0a)
+struct ffxQueryDescUpscaleGetResourceRequirements {
+    ffxQueryDescHeader header;
+    uint64_t required_resources;   // FfxApiQueryResourceIdentifiers bits the context needs to work correctly
+    uint64_t optional_resources;   // bits it uses when given
 };

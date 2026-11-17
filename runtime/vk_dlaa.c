@@ -358,6 +358,11 @@ VkImageView vk_dlaa_swap_view;
 static int dl_active(void) { return be_available() && !D.failed && D.on; }
 static uint64_t dl_evals(void) { return D.evals; }
 
+// Whether the upscaler uses the reactive (bias) mask: always for DLSS; for FSR what the context's resource requirements
+// say (vk_ffx_uses_reactive; 1 while there is no context yet, which the frame that makes it pays for once). Where it
+// does not, the class mask of mv_pass, the reactive mask pass and its copy of the light target are not done.
+static int reactive_wanted(void) { return !fsr_backend() || vk_ffx_uses_reactive(D.fx.ctx); }
+
 static void dl_fail(const char *what, NgxResult r) {
     rt_log("dlaa: %s failed (%08x): DLAA off for this run", what, (unsigned)r);
     D.failed = 1;
@@ -841,7 +846,7 @@ static struct Snap *snap_for(VkCommandBuffer cb, uint32_t w, uint32_t h, VkForma
 // At arming: the light target as it is before the transparents, outside any pass.
 static void mask_snapshot(VkExec *ex, const VkExecTarget *t) {
     R.cur = NULL;
-    if (mask_init() <= 0) return;
+    if (!reactive_wanted() || mask_init() <= 0) return;
     struct Snap *s = snap_for(ex->cb, t->width, t->height, t->format);
     if (!s) return;
     vk_exec_barrier(ex);
@@ -1130,8 +1135,8 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // TOTK_DLAA_MV=0: zero motion (test)
-    int masked = 0;
-    if (no_mv || !mv_pass(ex, e, zv, jx, jy, char_bias(), &masked)) {
+    int masked = 0, want_mask = reactive_wanted();
+    if (no_mv || !mv_pass(ex, e, zv, jx, jy, want_mask ? char_bias() : 0.0f, &masked)) {
         VkClearColorValue zero = {{0, 0, 0, 0}};
         VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, e->mv, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
@@ -1140,7 +1145,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     }
     VkImageView cv = vk_exec_target_view(t->img, t->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, t->level,
                                          t->base_layer, 1, 0);
-    struct Snap *mk = D.mv_samp ? mask_pass(cb, cv, w, h) : NULL;
+    struct Snap *mk = D.mv_samp && want_mask ? mask_pass(cb, cv, w, h) : NULL;
     int timed = T.on > 0 && T.used[T.slot];   // mv_pass began this frame's slot
     if (timed) times_mark(cb, T_DL0);
     uint64_t c0 = timed ? kern_now_ns() : 0;
@@ -1171,6 +1176,11 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
                             .sharpness = (float)sharp / 100.0f, .reset = D.reset};
         if (mk) fd.reactive = (VkFfxImage){mk->mask, VK_FORMAT_R8_UNORM, w, h};
         else if (masked) fd.reactive = (VkFfxImage){e->mask, VK_FORMAT_R8_UNORM, w, h};
+        // TOTK_FSR_TRANSPARENCY=1 (a test, FSR 3.1): the same mask also as the transparency and composition mask, which
+        // takes the history's protection off those pixels. vk_ffx_dispatch passes it only where the context takes it.
+        static int transp = -1;
+        if (transp < 0) transp = rt_knob("FSR_TRANSPARENCY", "0");
+        if (transp) fd.transparency = fd.reactive;
         c0 = timed ? kern_now_ns() : 0;
         int ok = vk_ffx_dispatch(fx, cb, &fd);
         if (timed) T.cpu_ngx += kern_now_ns() - c0;

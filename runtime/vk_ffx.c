@@ -20,6 +20,10 @@
 // images are exactly render-sized, so the region of them the upscaler reads is the whole image; FSR 3.1 reads its
 // inputs by integer load or by the input's own size (ffx_fsr3upscaler_callbacks_hlsl.h, prepare_inputs, upsample) and
 // keeps its internal images at maxRenderSize.
+//
+// The upscaler is also asked, once per context, which optional inputs it uses (ffxQueryDescUpscaleGetResourceRequirements:
+// vk_ffx_uses_reactive), so that a mask it does not read is not made, and, for FSR 3.1, ffxConfigure hands it the
+// constants that the TOTK_FSR_* settings name (constants_sync).
 #include "vk_ffx.h"
 
 #include "cfg.h"
@@ -42,12 +46,14 @@ int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t o
 int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite) {
     return (void)ctx, (void)depth_inverted, (void)depth_infinite, 1;
 }
+int vk_ffx_uses_reactive(const void *ctx) { return (void)ctx, 1; }
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) { return (void)ctx, (void)cb, (void)d, 0; }
 void vk_ffx_release(void *ctx) { (void)ctx; }
 const char *vk_ffx_version(void) { return ""; }
 #else
 #include <windows.h>
 #include <float.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +67,7 @@ static struct {
     HMODULE dll;
     PfnFfxCreateContext create;
     PfnFfxDestroyContext destroy;
+    PfnFfxConfigure configure;   // optional: without it the TOTK_FSR_* constants are left alone
     PfnFfxQuery query;
     PfnFfxDispatch dispatch;
     int tried, loaded, available;
@@ -77,13 +84,35 @@ int vk_ffx_wanted(void) {
     return wanted;
 }
 
+// The constants of the FSR 3.1 upscaler that ffxConfigure overrides (ffx_upscale.h, FfxApiConfigureUpscaleKey), each by a
+// setting of the same name that is unset by default: unset leaves AMD's value in force (the upscaler clamps a value to
+// the range it accepts, and a NULL value restores its default). settings.md describes them.
+static const struct {
+    const char *setting;
+    uint64_t key;
+} CONSTANTS[] = {
+    {"TOTK_FSR_VELOCITY_FACTOR", FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR},
+    {"TOTK_FSR_REACTIVENESS_SCALE", FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE},
+    {"TOTK_FSR_SHADING_CHANGE_SCALE", FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE},
+    {"TOTK_FSR_ACCUMULATION", FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME},
+    {"TOTK_FSR_MIN_DISOCCLUSION", FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION},
+};
+#define NCONSTANTS (sizeof CONSTANTS / sizeof *CONSTANTS)
+
 // What vk_ffx_create hands out: the ffx context, the sizes it was created for and the depth convention. All of them are
 // part of the context's creation (maxRenderSize, maxUpscaleSize, the depth flags) and cannot change afterwards, so they
-// are kept here for vk_ffx_fits and vk_ffx_depth_matches.
+// are kept here for vk_ffx_fits and vk_ffx_depth_matches. The rest is what the context has been told since.
 struct FfxCtx {
     ffxContext ctx;
     uint32_t max_w, max_h, ow, oh;
     int depth_inverted, depth_infinite;
+    int uses_reactive, uses_transparency;   // optional inputs the upscaler takes (resource requirements)
+    int needs_reactive;                     // it lists the reactive mask as required, not optional
+    int warned_reactive;                    // the missing required mask was logged
+    int constants_synced;                   // constants_sync has run, for the settings version below
+    unsigned constants_seen;
+    unsigned constants_warned;              // bit i: constant i's setting or its configure call was complained about
+    float applied[NCONSTANTS];              // what ffxConfigure last set for constant i; NaN: the upscaler's own value
 };
 
 static int loader_load(void) {
@@ -102,6 +131,7 @@ static int loader_load(void) {
     }
     F.create = (PfnFfxCreateContext)(void *)GetProcAddress(F.dll, "ffxCreateContext");
     F.destroy = (PfnFfxDestroyContext)(void *)GetProcAddress(F.dll, "ffxDestroyContext");
+    F.configure = (PfnFfxConfigure)(void *)GetProcAddress(F.dll, "ffxConfigure");   // may be missing: not fatal
     F.query = (PfnFfxQuery)(void *)GetProcAddress(F.dll, "ffxQuery");
     F.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(F.dll, "ffxDispatch");
     if (!F.create || !F.destroy || !F.query || !F.dispatch) {
@@ -187,6 +217,29 @@ static void on_message(uint32_t type, const wchar_t *msg) {
     rt_log("fsr: %s: %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", s);
 }
 
+// Which of the optional inputs this context takes, from the upscaler's own list of what it requires and what it uses when
+// given (FSR 3.1: reactive mask and transparency and composition mask optional; FSR 4 says for itself). Where the
+// query fails (an upscaler that predates it) the reactive mask is taken as used, as before the query was made, and the
+// transparency one as not.
+static void query_requirements(struct FfxCtx *fc) {
+    fc->uses_reactive = 1, fc->uses_transparency = 0, fc->needs_reactive = 0;
+    struct ffxQueryDescUpscaleGetResourceRequirements q = {
+        .header = {FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS, NULL}};
+    ffxReturnCode_t r = F.query(&fc->ctx, &q.header);
+    if (r != FFX_API_RETURN_OK) {
+        rt_log("fsr: the upscaler does not list its resource requirements (%u): the reactive mask is made as before", (unsigned)r);
+        return;
+    }
+    uint64_t all = q.required_resources | q.optional_resources;
+    fc->uses_reactive = (all & FFX_API_QUERY_RESOURCE_INPUT_REACTIVEMASK) != 0;
+    fc->uses_transparency = (all & FFX_API_QUERY_RESOURCE_INPUT_TRANSPARENCYCOMPOSITION) != 0;
+    fc->needs_reactive = (q.required_resources & FFX_API_QUERY_RESOURCE_INPUT_REACTIVEMASK) != 0;
+    rt_log("fsr: inputs required %#llx, optional %#llx: reactive mask %s, transparency and composition mask %s",
+           (unsigned long long)q.required_resources, (unsigned long long)q.optional_resources,
+           fc->needs_reactive ? "required" : fc->uses_reactive ? "used" : "not used",
+           fc->uses_transparency ? "used" : "not used");
+}
+
 void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
     if (!F.available) return NULL;
     struct ffxOverrideVersion ov = {.header = {FFX_API_DESC_TYPE_OVERRIDE_VERSION, NULL}, .versionId = F.version_id};
@@ -215,6 +268,8 @@ void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, in
     }
     fc->max_w = max_w, fc->max_h = max_h, fc->ow = ow, fc->oh = oh;
     fc->depth_inverted = depth_inverted != 0, fc->depth_infinite = depth_infinite != 0;
+    for (size_t i = 0; i < NCONSTANTS; i++) fc->applied[i] = NAN;   // a new context starts with the upscaler's own values
+    query_requirements(fc);
     struct ffxQueryGetProviderVersion pv = {.header = {FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, NULL}};
     F.query(&fc->ctx, &pv.header);
     rt_log("fsr: context created for scenes up to %ux%u -> %ux%u with %s (flags %#x)", max_w, max_h, ow, oh,
@@ -230,6 +285,11 @@ int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t o
 int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite) {
     const struct FfxCtx *fc = ctx;
     return !fc || (fc->depth_inverted == (depth_inverted != 0) && fc->depth_infinite == (depth_infinite != 0));
+}
+
+int vk_ffx_uses_reactive(const void *ctx) {
+    const struct FfxCtx *fc = ctx;
+    return !fc || fc->uses_reactive;
 }
 
 void vk_ffx_release(void *ctx) {
@@ -265,6 +325,45 @@ static struct FfxApiResource resource(const VkFfxImage *im, uint32_t usage, uint
     return r;
 }
 
+// Brings the context's constants in line with the TOTK_FSR_* settings: a changed or newly set one goes to ffxConfigure, an
+// unset one that was set before restores the upscaler's own value (a NULL value). Runs at a context's first dispatch and
+// after each settings change (cfg_version), not every frame. An upscaler that does not take a key (FSR 4's) is told so
+// once in the log, and a value that is not a number is ignored the same way.
+static void constants_sync(struct FfxCtx *fc) {
+    unsigned v = cfg_version();
+    if (!F.configure || (fc->constants_synced && fc->constants_seen == v)) return;
+    fc->constants_synced = 1, fc->constants_seen = v;
+    for (size_t i = 0; i < NCONSTANTS; i++) {
+        const char *text = cfg_get(CONSTANTS[i].setting);
+        float want = NAN;
+        if (text && *text) {
+            char *end;
+            double d = strtod(text, &end);
+            if (end != text && !*end && isfinite(d)) {
+                want = (float)d;
+            } else if (!(fc->constants_warned >> i & 1)) {
+                fc->constants_warned |= 1u << i;
+                rt_log("fsr: %s=%s is not a number: the upscaler's own value stays", CONSTANTS[i].setting, text);
+            }
+        }
+        if (isnan(want) ? isnan(fc->applied[i]) : want == fc->applied[i]) continue;
+        struct ffxConfigureDescUpscaleKeyValue kv = {
+            .header = {FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE, NULL}, .key = CONSTANTS[i].key,
+            .ptr = isnan(want) ? NULL : &want};
+        ffxReturnCode_t r = F.configure(&fc->ctx, &kv.header);
+        if (r != FFX_API_RETURN_OK) {
+            if (!(fc->constants_warned >> i & 1)) {
+                fc->constants_warned |= 1u << i;
+                rt_log("fsr: the upscaler did not take %s (%u): it applies to FSR 3.1", CONSTANTS[i].setting, (unsigned)r);
+            }
+            continue;
+        }
+        fc->applied[i] = want;
+        if (isnan(want)) rt_log("fsr: %s: the upscaler's own value again", CONSTANTS[i].setting);
+        else rt_log("fsr: %s set to %g", CONSTANTS[i].setting, (double)want);
+    }
+}
+
 // cameraNear and cameraFar the way the FSR SDK's sample integration hands them over (FidelityFX-SDK, the upscale
 // render module): with depth 1 at the near plane the two swap roles, cameraNear is the far end of the range and
 // cameraFar the near plane, and an infinite far plane is FLT_MAX, not a large finite distance. FSR 3.1 takes the
@@ -290,6 +389,7 @@ int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
                d->color.height, d->out.width, d->out.height, fc->max_w, fc->max_h, fc->ow, fc->oh);
         return 0;
     }
+    constants_sync(fc);
     ffxContext c = fc->ctx;
     struct ffxDispatchDescUpscale u;
     memset(&u, 0, sizeof u);
@@ -298,7 +398,16 @@ int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
     u.color = resource(&d->color, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_GENERIC_READ);
     u.depth = resource(&d->depth, FFX_API_RESOURCE_USAGE_DEPTHTARGET, FFX_API_RESOURCE_STATE_GENERIC_READ);
     u.motionVectors = resource(&d->mv, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_GENERIC_READ);
-    u.reactive = resource(&d->reactive, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_GENERIC_READ);
+    // The optional masks go along only where the context takes them (resource requirements)
+    if (fc->uses_reactive)
+        u.reactive = resource(&d->reactive, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_GENERIC_READ);
+    if (fc->uses_transparency)
+        u.transparencyAndComposition =
+            resource(&d->transparency, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_GENERIC_READ);
+    if (fc->needs_reactive && !d->reactive.image && !fc->warned_reactive) {
+        fc->warned_reactive = 1;
+        rt_log("fsr: the upscaler requires a reactive mask and none was made (dlss_char_mask = 0?)");
+    }
     u.output = resource(&d->out, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     u.jitterOffset = (struct FfxApiFloatCoords2D){d->jx * F.jitter_sign, d->jy * F.jitter_sign};
     u.motionVectorScale = (struct FfxApiFloatCoords2D){1.0f, 1.0f};

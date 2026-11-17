@@ -127,8 +127,12 @@ static int scene_for(double k, unsigned *w, unsigned *h) {
 // The scene's share of the output for a TOTK_DLSS mode; 0 for dlaa (the scene keeps base_k), while DLSS/DLAA is off
 // (the mode the menu still holds would shrink the scene for the plain upscaler) and where DLSS cannot run (dlss_dll).
 static double dlss_share(const char *m) {
-    static const struct { const char *name; double k; } dlss[] = {
-        {"quality", 2.0 / 3.0}, {"balanced", 0.58}, {"performance", 0.5}, {"ultra_performance", 1.0 / 3.0}};
+    // DLSS's shares, and FSR's, which are 1 over its per dimension ratios (ffx_upscale.h, FfxApiUpscaleQualityMode: 1.5, 1.7,
+    // 2.0, 3.0): only Balanced differs (0.58 against 1/1.7). The scene has to be the
+    // size the upscaler's own ratio gives, which the mip bias (res_fsr_lod_bias) follows.
+    static const struct { const char *name; double k, fsr; } dlss[] = {
+        {"quality", 2.0 / 3.0, 1.0 / 1.5}, {"balanced", 0.58, 1.0 / 1.7}, {"performance", 0.5, 1.0 / 2.0},
+        {"ultra_performance", 1.0 / 3.0, 1.0 / 3.0}};
     static int dll = -1;
     if (!cfg_bool("TOTK_DLAA")) return 0;
     for (int i = 0; i < (int)(sizeof dlss / sizeof dlss[0]); i++)
@@ -146,7 +150,11 @@ static double dlss_share(const char *m) {
                        "scene follows render_scale", m);
 #endif
             }
-            return dll ? dlss[i].k : 0;
+            if (!dll) return 0;
+#ifdef _WIN32
+            if (!strcmp(cfg_value("TOTK_DLAA_BACKEND"), "fsr")) return dlss[i].fsr;
+#endif
+            return dlss[i].k;
         }
     return 0;
 }

@@ -276,7 +276,8 @@
 # alone calls for (also at dlaa). Read at start.
 # dlaa_backend = dlss
 # What DLSS works from: dlaa (the 3D scene at full size), quality, balanced, performance or ultra_performance (the
-# scene at 67, 58, 50 or 33 % of the output, scaled up by DLSS; these replace render_scale and sharpen texture filtering
+# scene at 67, 58, 50 or 33 % of the output, scaled up by DLSS; with dlaa_backend = fsr Balanced is 59 %, FSR's 1.7:1;
+# these replace render_scale and sharpen texture filtering
 # to match). They apply only with dlaa = 1 and the DLSS model next to the executable; otherwise the scene follows
 # render_scale. Changes while the game runs take effect at once (1.4.3; 1.2.1 at the next start).
 # dlss = dlaa

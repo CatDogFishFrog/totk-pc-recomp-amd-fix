@@ -18,7 +18,7 @@ typedef struct {   // one image FSR reads or writes, in VK_IMAGE_LAYOUT_GENERAL,
 } VkFfxImage;
 
 typedef struct {
-    VkFfxImage color, depth, mv, reactive, out;   // reactive.image VK_NULL_HANDLE: none
+    VkFfxImage color, depth, mv, reactive, transparency, out;   // reactive, transparency .image VK_NULL_HANDLE: none
     float jx, jy;               // this frame's jitter, render pixels (window x right, y down), as the scene was drawn
     float dt_ms;                // time since the previous dispatch
     float cam_near, cam_far;    // view-space distances of the near and the far end of the depth range (vk_ffx.c swaps them for
@@ -43,7 +43,14 @@ void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, in
 int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh);
 // 1 when ctx was created with this depth convention (also for a NULL ctx, which has none to disagree).
 int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite);
-// Records the upscaling into cb. 0 on failure (logged). FSR binds pipelines and descriptors of its own.
+// 1 when ctx uses a reactive mask: the upscaler lists it among the inputs it requires or takes (queried when the
+// context is created). A mask the context does not take is work for nothing, so vk_dlaa.c does not make one then;
+// vk_ffx_dispatch leaves it out either way. 1 for a NULL ctx (none yet to ask) and where the upscaler cannot say.
+int vk_ffx_uses_reactive(const void *ctx);
+// Records the upscaling into cb. 0 on failure (logged). FSR binds pipelines and descriptors of its own. The reactive and
+// the transparency and composition image go along only where the context uses them (FSR 3.1 takes both as optional
+// inputs; the transparency one is for areas of special rendering such as reflections or animated textures, where it
+// takes the history's protection off).
 int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d);
 void vk_ffx_release(void *ctx);
 const char *vk_ffx_version(void);   // the upscaler version in use, for the log ("" before vk_ffx_init)
