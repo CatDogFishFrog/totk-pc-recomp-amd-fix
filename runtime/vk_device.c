@@ -138,7 +138,10 @@ static int create_instance(void) {
         validate = 0;
     }
     const char *ar = cfg_get("TOTK_ADDR_REPORT");
-    ab_want = !(ar && !strcmp(ar, "0")) && instance_ext_present(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // The messenger exists before the device does, so the validation layer finds the address binding message type without
+    // the device extension it needs (VUID-VkDebugUtilsMessengerCreateInfoEXT-messageType-parameter): with validation on,
+    // the address map for device faults stays off.
+    ab_want = !validate && !(ar && !strcmp(ar, "0")) && instance_ext_present(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (ab_want && !ab_ring && !(ab_ring = calloc(AB_N, sizeof *ab_ring))) ab_want = 0;
     if (validate || ab_want) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     if (vk_hdr_wanted() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
@@ -286,6 +289,9 @@ typedef struct {
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;
     VkPhysicalDevicePresentIdFeaturesKHR pid;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop;   // FSR 4 (vk_ffx.c)
+#ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR cds;   // FSR 3.1's shaders (vk_ffx.c)
+#endif
 #ifdef VK_EXT_SHADER_FLOAT8_EXTENSION_NAME
     VkPhysicalDeviceShaderFloat8FeaturesEXT f8;          // FSR 4 (vk_ffx.c)
 #endif
@@ -348,6 +354,10 @@ static int create_device(void) {
 #ifdef VK_EXT_SHADER_FLOAT8_EXTENSION_NAME
         else if (!strcmp(ext[i], VK_EXT_SHADER_FLOAT8_EXTENSION_NAME))
             CHAIN(f8, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT);
+#endif
+#ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+        else if (!strcmp(ext[i], VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
+            CHAIN(cds, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR);
 #endif
     }
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
@@ -419,7 +429,7 @@ static int create_device(void) {
     vk_caps.demote = c->f13.shaderDemoteToHelperInvocation;
     rt_log("vk: GPU address map for device faults: %s",
            has_abr && c->abr.reportAddressBinding ? "on (VK_EXT_device_address_binding_report; TOTK_ADDR_REPORT=0 turns it off)"
-           : !ab_want ? "off (TOTK_ADDR_REPORT=0 or no VK_EXT_debug_utils)"
+           : !ab_want ? "off (TOTK_ADDR_REPORT=0, no VK_EXT_debug_utils or TOTK_VK_VALIDATION=1)"
                       : "unavailable (no VK_EXT_device_address_binding_report)");
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     // VkPresentIdKHR on a present needs the presentId feature, not just the extension

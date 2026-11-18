@@ -155,13 +155,18 @@ static void add(const VkExtensionProperties *have, uint32_t nhave, const char **
 }
 
 // The extensions the FSR SDK's own sample enables for its effects (Cauldron2 device_vk.cpp): cooperative matrix and
-// 8-bit floats for FSR 4's network where the device has them. The rest it uses (16-bit floats and storage, integer
+// 8-bit floats for FSR 4's network where the device has them, and compute shader derivatives, which the shader
+// modules made while FSR 3.1.6's context is created declare (SPV_KHR_compute_shader_derivatives; the validation layer reports them as not enabled otherwise, and
+// drivers older than the extension, such as NVIDIA's 512.95, cannot offer it). The rest it uses (16-bit floats and storage, integer
 // dot products, subgroup size control) is core Vulkan 1.3, which vk_device.c enables as far as the driver reports it.
 void vk_ffx_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t max) {
     if (!vk_ffx_wanted()) return;
     add(have, nhave, ext, n, max, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 #ifdef VK_EXT_SHADER_FLOAT8_EXTENSION_NAME
     add(have, nhave, ext, n, max, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+#endif
+#ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+    add(have, nhave, ext, n, max, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
 #endif
 }
 
