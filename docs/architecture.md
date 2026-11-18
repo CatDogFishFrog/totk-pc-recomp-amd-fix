@@ -140,8 +140,9 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   shared. `amd_fidelityfx_loader_vk.dll` (FSR SDK 2.4) is loaded at run time from the executable's folder and finds
   `amd_fidelityfx_upscaler_vk.dll` next to it; only the descriptor layouts of `ffx_api_min.h` are compiled in. At
   start the upscaler's versions for the device are listed and the newest FSR 4 is pinned where the DLL offers it (the
-  DLL decides which GPUs get it), else its default (FSR 3.1). `vk_device.c` enables `VK_KHR_cooperative_matrix` and
-  `VK_EXT_shader_float8` with their features when the device has them. FSR also asks for the camera's near and far
+  DLL decides which GPUs get it), else its default (FSR 3.1). `vk_device.c` enables `VK_KHR_cooperative_matrix`,
+  `VK_EXT_shader_float8` and a compute shader derivatives extension (KHR, else NV) with their features when the device has
+  them. How the upscaler is built, with what it is given and what is established about it: [dlaa.md](dlaa.md). FSR also asks for the camera's near and far
   distances and field of view, which `cam_params` reads from the projection in the scene camera block (`vk_ffx.c`
   `camera_range` hands the distances over as AMD's own integration does: swapped where depth is inverted, `FLT_MAX` for
   an infinite far plane), and the depth

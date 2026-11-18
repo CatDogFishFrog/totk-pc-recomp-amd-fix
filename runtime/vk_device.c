@@ -12,6 +12,7 @@
 #include "vk.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_ffx.h"
 
 static VkCtx g_vk;
 static int g_ready;
@@ -290,12 +291,46 @@ typedef struct {
     VkPhysicalDevicePresentIdFeaturesKHR pid;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop;   // FSR 4 (vk_ffx.c)
 #ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
-    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR cds;   // FSR 3.1's shaders (vk_ffx.c)
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR cds;   // shader modules made while an FSR context is created (vk_ffx.c)
+#endif
+#ifdef VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cdsnv;   // the same, where the device has this one and not the KHR one
 #endif
 #ifdef VK_EXT_SHADER_FLOAT8_EXTENSION_NAME
     VkPhysicalDeviceShaderFloat8FeaturesEXT f8;          // FSR 4 (vk_ffx.c)
 #endif
 } FeatureChain;
+
+// What FSR's shaders ask of the device beyond core Vulkan, for the log of a run with dlaa_backend = fsr (vk_ffx.c): which
+// compute shader derivatives extension is enabled (KHR, NV or none) with its two features, and whether storage images
+// can be read without a format. Neither is a requirement of the project: a missing one is only reported. The shader modules
+// FSR creates on this device declare SPV_KHR_compute_shader_derivatives, which the validation layer accepts with either
+// extension's computeDerivativeGroupLinear; shaderStorageImageReadWithoutFormat is Vulkan's counterpart of the typed UAV
+// loads that the FSR 3.1 guide lists under Limitations. h is the feature set the device is created with.
+static void fsr_feature_log(const FeatureChain *c, const char *const *ext, uint32_t n_ext, const VkPhysicalDeviceFeatures *h) {
+    const char *deriv = "none: the device offers neither VK_KHR_ nor VK_NV_compute_shader_derivatives";
+    int linear = 0, quads = 0;
+    for (uint32_t i = 0; i < n_ext; i++) {
+#ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+        if (!strcmp(ext[i], VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
+            deriv = "VK_KHR_compute_shader_derivatives", linear = c->cds.computeDerivativeGroupLinear,
+            quads = c->cds.computeDerivativeGroupQuads;
+#endif
+#ifdef VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+        if (!strcmp(ext[i], VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
+            deriv = "VK_NV_compute_shader_derivatives", linear = c->cdsnv.computeDerivativeGroupLinear,
+            quads = c->cdsnv.computeDerivativeGroupQuads;
+#endif
+    }
+    (void)c, (void)linear, (void)quads;
+    rt_log("vk: FSR device features: compute shader derivatives %s (computeDerivativeGroupLinear %d, "
+           "computeDerivativeGroupQuads %d); shaderStorageImageReadWithoutFormat %d, shaderStorageImageWriteWithoutFormat %d",
+           deriv, linear, quads, (int)h->shaderStorageImageReadWithoutFormat, (int)h->shaderStorageImageWriteWithoutFormat);
+    if (!h->shaderStorageImageReadWithoutFormat)
+        rt_log("vk: shaderStorageImageReadWithoutFormat is not supported on %s: the FSR 3.1 guide lists typed UAV loads "
+               "under Limitations, so its shaders may read storage images wrongly here (not required by the project)",
+               g_vk.props.deviceName);
+}
 
 static int create_device(void) {
     uint32_t ne = 0;
@@ -358,6 +393,10 @@ static int create_device(void) {
 #ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
         else if (!strcmp(ext[i], VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
             CHAIN(cds, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR);
+#endif
+#ifdef VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+        else if (!strcmp(ext[i], VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME))
+            CHAIN(cdsnv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV);
 #endif
     }
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
@@ -431,6 +470,7 @@ static int create_device(void) {
            has_abr && c->abr.reportAddressBinding ? "on (VK_EXT_device_address_binding_report; TOTK_ADDR_REPORT=0 turns it off)"
            : !ab_want ? "off (TOTK_ADDR_REPORT=0, no VK_EXT_debug_utils or TOTK_VK_VALIDATION=1)"
                       : "unavailable (no VK_EXT_device_address_binding_report)");
+    if (vk_ffx_wanted()) fsr_feature_log(c, ext, n_ext, h);
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     // VkPresentIdKHR on a present needs the presentId feature, not just the extension
     if (g_vk.has_nv_reflex && !c->pid.presentId) {

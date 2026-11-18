@@ -155,19 +155,30 @@ static void add(const VkExtensionProperties *have, uint32_t nhave, const char **
 }
 
 // The extensions the FSR SDK's own sample enables for its effects (Cauldron2 device_vk.cpp): cooperative matrix and
-// 8-bit floats for FSR 4's network where the device has them, and compute shader derivatives, which the shader
-// modules made while FSR 3.1.6's context is created declare (SPV_KHR_compute_shader_derivatives; the validation layer reports them as not enabled otherwise, and
-// drivers older than the extension, such as NVIDIA's 512.95, cannot offer it). The rest it uses (16-bit floats and storage, integer
-// dot products, subgroup size control) is core Vulkan 1.3, which vk_device.c enables as far as the driver reports it.
+// 8-bit floats for FSR 4's network where the device has them, and compute shader derivatives. The shader modules that are
+// created on this device while an FSR context is made declare SPV_KHR_compute_shader_derivatives, and the validation
+// layer reports them as not enabled without it. Which of the upscaler DLL's versions makes those modules is not
+// established (the log names no module, and the DLL lists FSR 3.1.6 and 2.3.4 side by side); the device has to offer the
+// extension either way. Vulkan accepts that SPIR-V extension with VK_KHR_compute_shader_derivatives or with its older
+// VK_NV_compute_shader_derivatives, so the NV one is the fallback where the KHR one is missing. Whether a driver offers
+// either is read from the device: vk_device.c logs which one is enabled. The rest FSR uses (16-bit floats and storage,
+// integer dot products, subgroup size control) is core Vulkan 1.3, which vk_device.c enables as far as the driver reports it.
 void vk_ffx_device_exts(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t max) {
     if (!vk_ffx_wanted()) return;
     add(have, nhave, ext, n, max, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 #ifdef VK_EXT_SHADER_FLOAT8_EXTENSION_NAME
     add(have, nhave, ext, n, max, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
 #endif
+    int khr = 0;
 #ifdef VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
     add(have, nhave, ext, n, max, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    for (uint32_t i = 0; i < *n; i++)
+        if (!strcmp(ext[i], VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) khr = 1;
 #endif
+#ifdef VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+    if (!khr) add(have, nhave, ext, n, max, VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+#endif
+    (void)khr;
 }
 
 void vk_ffx_init(void) {

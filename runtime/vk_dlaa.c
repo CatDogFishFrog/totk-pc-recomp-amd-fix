@@ -903,8 +903,37 @@ static int ended_at(const VkExec *ex) {
     return !ex->chunked || ex->fence != D.end_fence || ex->pos >= D.end_pos;
 }
 
+// The viewport and scissor of the scene's draws against the render area and the depth target they draw into, logged once
+// for each distinct combination (eight at most). The render resolution the upscaler gets is the size of the light target
+// (evaluate), so a viewport or a scissor smaller than the target would leave edge pixels that it reads undrawn.
+// v is the viewport as draw_viewport made it: y flipped (negative height), before the jitter is added.
+static void note_scene_viewport(const VkExec *ex, const VkViewport *v) {
+    static uint64_t seen[8];
+    static unsigned nseen;
+    const VkRect2D sc = vk_exec_scissor(ex);
+    const float vw = v->width, vh = fabsf(v->height), vx = v->x, vy = v->y + v->height;
+    const uint32_t f[] = {(uint32_t)(vw * 16.0f), (uint32_t)(vh * 16.0f), sc.extent.width, sc.extent.height,
+                          (uint32_t)sc.offset.x, (uint32_t)sc.offset.y, ex->pass_w, ex->pass_h, ex->depth.width,
+                          ex->depth.height};
+    uint64_t key = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof f / sizeof *f; i++) key = (key ^ f[i]) * 1099511628211ull;
+    unsigned n = __atomic_load_n(&nseen, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n && i < 8; i++)
+        if (seen[i] == key) return;
+    unsigned slot = __atomic_fetch_add(&nseen, 1, __ATOMIC_ACQ_REL);
+    if (slot >= 8) return;
+    seen[slot] = key;
+    int whole = vw == (float)ex->depth.width && vh == (float)ex->depth.height && vx == 0.0f && vy == 0.0f &&
+                sc.extent.width == ex->depth.width && sc.extent.height == ex->depth.height && !sc.offset.x && !sc.offset.y;
+    rt_log("dlaa: scene viewport %gx%g at (%g, %g), scissor %ux%u at (%d, %d), render area %ux%u, depth target %ux%u: %s",
+           (double)vw, (double)vh, (double)vx, (double)vy, sc.extent.width, sc.extent.height, sc.offset.x, sc.offset.y,
+           ex->pass_w, ex->pass_h, ex->depth.width, ex->depth.height,
+           whole ? "both cover the whole target" : "NOT the whole target");
+}
+
 void vk_dlaa_viewport(VkExec *ex, VkViewport *v) {
     if (!D.jit_ok || !ex->depth.image || ex->depth.image != D.jdepth || ended_at(ex)) return;
+    if (fsr_backend()) note_scene_viewport(ex, v);
     v->x += D.jx, v->y += D.jy;
     D.ux = D.jx, D.uy = D.jy;
     __atomic_store_n(&D.jit_used, 1, __ATOMIC_RELAXED);
@@ -1274,6 +1303,22 @@ upscaled:
     vk_exec_draw_new_cb(ex);   // NGX bound pipelines and descriptor sets of its own: the next draw binds everything again
     D.jdepth = z->image;
     next_jitter(w, ow);
+    // The render resolution the upscaler gets is the size of the light target the game drew (w x h); resolution.c only asks
+    // for a nominal scene size, and the game's own setup has made the targets smaller than it by up to 7 pixels a side
+    // (docs/dlaa.md, "Render resolution"). Logged when either size changes, with the Mipmap bias worked out from each.
+    static uint32_t seen_size[4];
+    if (w != seen_size[0] || h != seen_size[1] || ow != seen_size[2] || oh != seen_size[3]) {
+        seen_size[0] = w, seen_size[1] = h, seen_size[2] = ow, seen_size[3] = oh;
+        unsigned no[2], ns[2];
+        res_sizes(no, ns);
+        double k = (double)w / ow;
+        double from_render = log2(k > 1.0 ? 1.0 : k) - (fsr ? 1.0 : 0.0);
+        rt_log("dlaa: render resolution %ux%u for presentation resolution %ux%u (ratio %.4f x %.4f); nominal scene %ux%u%s; "
+               "mipmap bias %.3f from the nominal scene, %.3f from the render resolution",
+               w, h, ow, oh, (double)ow / w, (double)oh / h, ns[0], ns[1],
+               w == ns[0] && h == ns[1] ? " (the same)" : " (differs)",
+               (double)(fsr ? res_fsr_lod_bias() : res_dlss_lod_bias()), from_render);
+    }
     if (++D.evals == 1 || D.evals == 300 || D.evals % 3600 == 0)   // 300: one early line with the frames counted
         rt_log("dlaa: %llu frames anti-aliased (scene %ux%u, output %ux%u; %llu frames without the DLAA point, %llu with camera "
                "motion, %llu with the characters' mask, %llu without a camera, %llu jitter holds; resets: %llu size, %llu "
@@ -1446,7 +1491,17 @@ static void dlss_mode(void) {
         res_dlss_mode(m);
     }
     float b = !dl_active() ? 0.0f : fsr_backend() ? res_fsr_lod_bias() : res_dlss_lod_bias();
-    if (b != bias) bias = b, vk_sampler_dlss_bias(b);
+    if (b == bias) return;
+    bias = b, vk_sampler_dlss_bias(b);
+    // What goes into the samplers (the game's own bias plus this one, clamped to the device's limit in vk_texture.c
+    // make_sampler), and what it was worked out from: the nominal scene size of resolution.c, which the game's light
+    // target can undercut (evaluate logs the render resolution it really got).
+    unsigned o[2], s[2];
+    res_sizes(o, s);
+    const VkCtx *c = vk_ctx();
+    rt_log("dlaa: mipmap bias %.3f added to the material samplers (%s; nominal scene %ux%u, presentation resolution %ux%u; "
+           "device limit %.2f)", (double)b, !dl_active() ? "no upscaling" : fsr_backend() ? "FSR: log2(k) - 1" : "DLSS: log2(k)",
+           s[0], s[1], o[0], o[1], c ? (double)c->props.limits.maxSamplerLodBias : 0.0);
 }
 
 
