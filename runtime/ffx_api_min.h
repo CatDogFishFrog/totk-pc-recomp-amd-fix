@@ -202,6 +202,11 @@ enum FfxApiCreateContextUpscaleFlags {
     FFX_UPSCALE_ENABLE_AUTO_EXPOSURE = (1 << 5),
     FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION = (1 << 6),
     FFX_UPSCALE_ENABLE_DEBUG_CHECKING = (1 << 7),
+    FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION = (1 << 9),   // TODO(debug-view): FSR 3.1's Debug view needs it at creation
+};
+
+enum FfxApiDispatchUpscaleFlags {
+    FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW = (1 << 0),   // TODO(debug-view): draws FSR 3.1's Debug view over the output
 };
 
 #define FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_UPSCALE, 0x00)

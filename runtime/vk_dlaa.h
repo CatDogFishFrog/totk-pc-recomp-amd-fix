@@ -46,6 +46,11 @@ void vk_mvprev_draw(VkExec *ex);   // vk_mvprev.c: notes the scene draw's object
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,
                      uint32_t h);
 int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]);
+// Reactive mask from alpha (FSR, vk_exec_draw.c): the alpha-blended draws into the armed light target are listed again
+// during the replay (vk_dlaa_reactive_alpha says whether a draw is one the mask may take) and mv_pass records them
+// with vk_alphaobj_execute into an R8 image cleared to 1, which dlaa_mv.comp turns into the mask. Returns the draws.
+int vk_dlaa_reactive_alpha(const VkExec *ex);
+int vk_alphaobj_execute(VkExec *ex, VkImageView target, VkImageView depth, VkFormat depth_fmt, uint32_t w, uint32_t h);
 // vk_mvcheck.c (TOTK_MV_CHECK, test): mv_pass hands it the motion image after the camera pass and, after the object
 // pass, the motion image again and the scene light target it ran on; it measures how well the vectors fit the picture.
 void vk_mvcheck_camera(VkCommandBuffer cb, VkImage mv, uint32_t w, uint32_t h, float jx, float jy);

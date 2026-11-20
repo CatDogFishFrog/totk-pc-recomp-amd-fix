@@ -37,6 +37,7 @@ static int g_font_bad;
 extern "C" {
 #include "amiibo.h"
 #include "cheats.h"
+#include "dlaa_debug.h"   // TODO(debug-view)
 #include "cfg.h"
 #include "fs.h"
 #include "input.h"
@@ -716,6 +717,30 @@ static void rows_color(void) {
     }
 }
 
+// TODO(debug-view): the Debug section of the Video tab and its labels (dlaa_debug.h); remove with the rest after the tests.
+// Plain text rows, not settings of the cfg table: the state is not saved and is off at every start.
+static void rows_debug(void) {
+    static const char *const modes[] = {"Off", "FSR Debug view", "Inputs", "FSR Debug view and inputs"};
+    static const char *const colors[] = {"Technical buffers", "Color buffer (input)", "Both"};
+    opt_group_text("Debug");   // TODO(debug-view)
+    const char *avail = dlaa_debug_available() ? nullptr : "AMD FSR is not the upscaler in use";
+    int mode = dlaa_debug_mode(), color = dlaa_debug_color();
+    int s = opt_text_row("##debug_view", "Debug view", modes[mode], avail,
+                         "TODO(debug-view): a test row. FSR's own Debug view needs FSR 3.1.", false);
+    if (s) mode = s == -1 ? (mode + 3) % 4 : (mode + 1) % 4;
+    s = opt_text_row("##debug_view_color", "Debug view: Color buffer", colors[color], nullptr,
+                     "TODO(debug-view): a test row. For the inputs view only.", false);
+    if (s) color = s == -1 ? (color + 2) % 3 : (color + 1) % 3;
+    static const char *const views[] = {"Grid", "Reactive mask (input)", "T&C mask (input)", "Motion vectors (input)",
+                                        "Depth buffer (input)"};
+    int view = dlaa_debug_view();
+    s = opt_text_row("##debug_view_layout", "Debug view: Inputs", views[view], nullptr,
+                     "TODO(debug-view): a test row. The grid, or one input over the whole picture.", false);
+    if (s) view = s == -1 ? (view + 4) % 5 : (view + 1) % 5;
+    if (mode != dlaa_debug_mode() || color != dlaa_debug_color() || view != dlaa_debug_view())
+        dlaa_debug_set(mode, color, view);
+}
+
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
     opt_toggle("TOTK_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
@@ -768,6 +793,7 @@ static void tab_screen(float scale) {
     opt_slider("TOTK_HDR_GAME_NITS", UI_MENU_HDR_GAME, 80, 500, UI_MENU_HDR_GAME_DESC, 5, "%.0f");
     opt_slider("TOTK_HDR_UI_NITS", UI_MENU_HDR_UI, 80, 500, UI_MENU_HDR_UI_DESC, 5, "%.0f");
     opt_slider("TOTK_HDR_HUE", UI_MENU_HDR_HUE, 0, 100, UI_MENU_HDR_HUE_DESC, 5, "%.0f %%");
+    rows_debug();   // TODO(debug-view)
     opt_end();
 }
 
@@ -1691,6 +1717,27 @@ static void perf_draw(const MenuTarget *t, float scale) {
     dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), g_perf_text);
 }
 
+// TODO(debug-view): the labels of the Debug view (vk_dlaa.c dlaa_debug_labels), at the top left of each tile. The picture is
+// the game image, fitted into the window.
+static void debug_labels_draw(const MenuTarget *t, float scale) {
+    DlaaDebugLabel l[16];
+    int n = dlaa_debug_labels(l, 16);
+    if (!n) return;
+    float W = (float)t->width, H = (float)t->height, x0 = 0, y0 = 0, pw = W, ph = H;
+    if (t->image_w > 0 && t->image_h > 0) {
+        float k = fminf(W / (float)t->image_w, H / (float)t->image_h);
+        pw = t->image_w * k, ph = t->image_h * k, x0 = (W - pw) / 2, y0 = (H - ph) / 2;
+    }
+    ImDrawList *dl = g_open.load(std::memory_order_relaxed) ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+    float pad = 4 * scale;
+    for (int i = 0; i < n; i++) {
+        ImVec2 sz = ImGui::CalcTextSize(l[i].label);
+        ImVec2 p(x0 + l[i].x * pw + pad, y0 + l[i].y * ph + pad);
+        dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 2, p.y + sz.y + pad * 2), IM_COL32(0, 0, 0, 170), 3 * scale);
+        dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 240), l[i].label);
+    }
+}
+
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     *shot = NULL;
     cheats_frame(frame);   // the data cheats and the buttons of the cheats that need them held
@@ -1760,6 +1807,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     ImGui::NewFrame();
     if (open) layout_menu(t->width, t->height, scale);
     perf_draw(t, scale);
+    debug_labels_draw(t, scale);   // TODO(debug-view)
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;

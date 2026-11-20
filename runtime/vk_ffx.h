@@ -26,6 +26,7 @@ typedef struct {
     float fov_y;                // vertical field of view, radians
     float sharpness;            // FSR's own sharpening pass (RCAS) on its output, 0..1; 0: none
     int reset;                  // a new history
+    int debug_view;             // TODO(debug-view): FSR 3.1's Debug view over the output (only on a context made with it)
 } VkFfxDispatch;
 
 // A context for one output size that renders at any scene size up to max_w x max_h: it is created with the upscaler's
@@ -37,7 +38,13 @@ typedef struct {
 // the context: when the game's depth convention changes, the context has to be released and a new one created
 // (vk_ffx_depth_matches tells).
 // NULL on failure (logged).
-void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite);
+// debug_view: TODO(debug-view) the context is made with FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION (vk_ffx_debug_matches).
+void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite,
+                    int debug_view);
+// TODO(debug-view): 1 when ctx takes the transparency and composition mask (0 for a NULL ctx).
+int vk_ffx_uses_transparency(const void *ctx);
+// TODO(debug-view): 1 when ctx was made with (or without) the Debug view's creation flag as asked (1 for a NULL ctx).
+int vk_ffx_debug_matches(const void *ctx, int debug_view);
 // 1 when ctx can upscale a w x h scene to ow x oh: the output size is the one it was made for and the scene is within
 // its largest render size. 0 for a NULL ctx.
 int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh);

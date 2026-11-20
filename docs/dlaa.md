@@ -48,8 +48,51 @@ is not in this project: what happens inside is known only from the SDK's public 
   colour flag is set yet.
 - **One context per run**: created with the dynamic-resolution flag and the largest expected render resolution; each
   dispatch states its own `renderSize`.
-- Optional inputs (reactive mask and so on) are asked of the upscaler once per context (`vk_ffx_uses_reactive`). For FSR 3.1,
-  `ffxConfigure` hands it the constants the `fsr_*` settings name.
+- Optional inputs are asked of the upscaler once per context (`vk_ffx_uses_reactive`, `vk_ffx_uses_transparency`). For
+  FSR 3.1, `ffxConfigure` hands it the constants the `fsr_*` settings name.
+
+## The inputs, one by one: used or not
+
+Every input of the FSR dispatch is either supplied by this code or it is not. There is no third state: an input that has
+no real source is left out and the log says so.
+
+| Input | State | What it is |
+| --- | --- | --- |
+| Colour, depth, jitter, reset, render and presentation size, camera near/far/fov, frame time | used | As above. |
+| Motion vectors | used | The camera's reprojection from depth (`dlaa_mv.comp`) with the per-object draws (`dlaa_objmv`, `vk_exec_draw.c`) written over it. |
+| Sharpness | used | `sharpness` from the `sharpness` setting; `enableSharpening` when it is above 0. |
+| Reactive mask | used | `e->mask`, written by `mv_pass`; contents below. |
+| Transparency and composition mask | **not supplied** | No source for it is implemented. `fd.transparency` stays empty, `vk_ffx_dispatch` hands FSR nothing, and the log says `fsr: transparency and composition mask: not supplied`. The Debug view's input panel says the same. |
+| Exposure | not supplied | `AUTO_EXPOSURE` is set on the context. |
+
+## What goes into which mask
+
+The FSR guide gives each mask its own job, and nothing is put into one that belongs in another.
+
+- **Reactive mask**: where this frame's colour is to count for more than the history because the pixel's colour is not
+  that of a surface that moved with the motion vector. Two things are written into it, the larger of the two per pixel:
+  1. *Alpha of alpha-blended draws* (particles, smoke, sparks): what the guide asks for. The draws are recorded a second
+     time with the game's own shaders into an R8 target and their alpha accumulates there (`alpha_draw`,
+     `vk_alphaobj_execute`, `dlaa_mv.comp`); the value is at most `DLAA_ALPHA_CAP` (0.9). The sky takes none (scene depth at
+     the far plane). Draws it does not take are counted by cause in the log line `vk_exec: reactive mask draws`: blends
+     without an alpha factor (plain additive), line loops, byte indices, indirect draws, draws with
+     storage resources, draws still waiting for their pipeline. Those are not in the mask. `fsr_alpha = 0` turns this off.
+  2. *The characters' class mask*: characters, creatures and what they hold, from the G-buffer's class channel, and where
+     they were the frame before. A character's vector is the camera's only where per-object motion does not reach it, and
+     the guide names drawing such an object into the reactive mask as the way to limit its ghosting. Value `dlss_char_mask`
+     per cent, at most 0.9 for FSR.
+- **Transparency and composition mask**: for areas of special shading that has no motion, such as reflections or animated
+  textures. Nothing in the game's draws has been identified as such a source, so nothing is supplied (see above).
+- **Motion vectors**: motion that comes from a vertex shader (wind in grass, cloth) belongs here, not in a mask. Draws that
+  read no object blocks, terrain and grass among them, are not listed for per-object motion (`mvobj_all = 0`), so their
+  vectors are the camera's. The mask code does not cover for that.
+
+## Rule: no stand-ins
+
+If an input, a mask or a feature is not implemented, it is absent, and the log says so in plain words (`not supplied`,
+`not implemented`, an error where it is one). Nothing is filled in with something that merely looks like it: a copy of
+another mask, a constant, a guess from the picture. This documentation uses the same two words for every input: used, or
+not. Work that is wanted but not done is listed as not done, with what it waits for.
 
 ## Render resolution
 

@@ -1,0 +1,68 @@
+#version 450
+// TODO(debug-view): remove with the rest of the Debug view (runtime/dlaa_debug.h) after the tests.
+// One tile of the inputs view (vk_dlaa.c debug_inputs): a buffer that the project hands to AMD FSR, drawn into a
+// rectangle of the upscaled picture. What is drawn is what the buffer holds: an input that was not supplied is black, and
+// nothing is added or smoothed to make a tile look better.
+//   kind 0: Reactive mask (input), R8, shown as grey
+//   kind 1: Transparency & composition mask (input), R8, shown as grey
+//   kind 2: Motion vectors (input), render pixels: the hue is the direction, the brightness is 1 - exp(-length / 2)
+//   kind 3: Depth buffer (input): the distance from the camera, in a logarithmic scale from the near plane (white) to
+//           1000 m (black); the hardware depth is linearised with the camera values vk_dlaa.c cam_params gives FSR
+//   kind 4: Color buffer (input): the scene light, clamped to 0..1 and encoded with the sRGB curve
+// split 1: the whole tile is the Color buffer (input); split 2: its right half is the Color buffer (input) and its left
+// half the buffer of this kind, both taken at the same place of the picture (the tile is cut in two, not squeezed).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D reactive_tex;
+layout(binding = 1) uniform sampler2D transp_tex;
+layout(binding = 2) uniform sampler2D mv_tex;
+layout(binding = 3) uniform sampler2D depth_tex;
+layout(binding = 4) uniform sampler2D color_tex;
+layout(binding = 5, rgba16f) uniform writeonly image2D out_img;
+layout(push_constant) uniform P {
+    ivec4 rect;     // x, y, width, height of the tile in the output, pixels
+    int kind;
+    int split;      // 0: this buffer only, 1: the Color buffer only, 2: both, side by side
+    int present;    // 0: this buffer was not supplied to FSR: black
+    int inverted;   // depth 1 is near
+    float near_m;
+    float far_m;
+    int infinite;   // no far plane
+    int pad;
+} pc;
+
+vec3 hue(float h) {
+    return clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+}
+
+vec3 srgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+vec3 technical(int kind, vec2 uv) {
+    if (pc.present == 0) return vec3(0.0);
+    if (kind == 0) return vec3(texture(reactive_tex, uv).r);
+    if (kind == 1) return vec3(texture(transp_tex, uv).r);
+    if (kind == 2) {
+        vec2 mv = texture(mv_tex, uv).rg;
+        float len = length(mv);
+        if (len <= 0.0) return vec3(0.0);
+        float h = atan(mv.y, mv.x) / 6.2831853 + 0.5;
+        return hue(h) * (1.0 - exp(-len * 0.5));
+    }
+    float d = texture(depth_tex, uv).r;
+    if (pc.inverted != 0) d = 1.0 - d;
+    float z = pc.infinite != 0 ? pc.near_m / max(1.0 - d, 1e-7)
+                               : pc.near_m * pc.far_m / max(pc.far_m - d * (pc.far_m - pc.near_m), 1e-7);
+    float t = log2(max(z, pc.near_m) / pc.near_m) / log2(1000.0 / pc.near_m);
+    return vec3(1.0 - clamp(t, 0.0, 1.0));
+}
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= pc.rect.z || q.y >= pc.rect.w) return;
+    vec2 uv = (vec2(q) + 0.5) / vec2(pc.rect.zw);
+    bool color = pc.split == 1 || (pc.split == 2 && uv.x >= 0.5);
+    vec3 c = color ? srgb(texture(color_tex, uv).rgb) : technical(pc.kind, uv);
+    imageStore(out_img, pc.rect.xy + q, vec4(c, 1.0));
+}

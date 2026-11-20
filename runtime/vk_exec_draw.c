@@ -3451,7 +3451,10 @@ typedef struct {
     uint32_t count, instances, base_instance;
     int32_t base_vertex;
     uint64_t cam;                // the draw's camera block (c4), this frame's
+    uint32_t first;              // first vertex of a draw without indices
+    uint8_t kind, indexed;       // MO_MOTION or MO_ALPHA; 0: vkCmdDraw
 } MoDraw;
+enum { MO_MOTION, MO_ALPHA };   // MO_ALPHA: the reactive mask's draws (alpha_draw_), recorded by vk_alphaobj_execute
 typedef struct { VkBuffer b[17]; VkDeviceSize o[17], sz[17], str[17]; } MoVb;
 static struct {
     uint64_t frame, fence;       // the frame and submission the list belongs to
@@ -3649,7 +3652,7 @@ static uint32_t mo_vertex_buffers(VkExec *ex) {
 
 // Records the list into cb (the replay's command buffer, inside the motion pass's rendering), skipping what the draw
 // before already set.
-static void mo_emit(VkCommandBuffer cb) {
+static void mo_emit_range(VkCommandBuffer cb, const MoDraw *list, int count) {
     int dyn_vi = vk_pipeline_vertex_input_dynamic();
     VkPipeline pipe = VK_NULL_HANDLE;
     uint32_t st = UINT32_MAX, vb = UINT32_MAX;
@@ -3658,8 +3661,8 @@ static void mo_emit(VkCommandBuffer cb) {
     int pdesc[2] = {-1, -1};      // the pushed set's descriptors (MQ.desc index) under lay/pinfo, -1 none
     VkDescriptorSet bound[2] = {0};
     const MoDraw *p = NULL;
-    for (int n = 0; n < MQ.n; p = &MQ.d[n++]) {
-        const MoDraw *q = &MQ.d[n];
+    for (int n = 0; n < count; p = &list[n++]) {
+        const MoDraw *q = &list[n];
         const VkPipeInfo *info = q->info;
         if (q->pipe != pipe) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, q->pipe), pipe = q->pipe, MO.e_pipe++;
         if (q->st != st) vk_pipeline_set_dynamic(cb, &MQ.st[q->st]), st = q->st, MO.e_dyn++;
@@ -3708,11 +3711,17 @@ static void mo_emit(VkCommandBuffer cb) {
             vkCmdBindVertexBuffers2(cb, 0, 17, v->b, v->o, v->sz, dyn_vi ? NULL : v->str);
             vb = q->vb, MO.e_vb++;
         }
-        if (!p || q->ib != p->ib || q->ib_off != p->ib_off || q->it != p->it) vkCmdBindIndexBuffer(cb, q->ib, q->ib_off, q->it);
-        vkCmdDrawIndexed(cb, q->count, q->instances, 0, q->base_vertex, q->base_instance);
+        if (q->indexed) {
+            if (!p || !p->indexed || q->ib != p->ib || q->ib_off != p->ib_off || q->it != p->it)
+                vkCmdBindIndexBuffer(cb, q->ib, q->ib_off, q->it);
+            vkCmdDrawIndexed(cb, q->count, q->instances, 0, q->base_vertex, q->base_instance);
+        } else {
+            vkCmdDraw(cb, q->count, q->instances, q->first, q->base_instance);
+        }
         MO.e_draws++;
     }
 }
+static void mo_emit(VkCommandBuffer cb) { mo_emit_range(cb, MQ.d, MQ.n); }
 
 static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0);
 static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off) {
@@ -4029,6 +4038,7 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     // into the frame's list, past the primary's binding caches (mo_desc); mo_emit records it
     MQ.d = mo_grow(MQ.d, &MQ.cap, MQ.n + 1, sizeof *MQ.d);
     MoDraw *q = &MQ.d[MQ.n];
+    q->kind = MO_MOTION, q->indexed = 1, q->first = 0;
     float par_in[4] = {(float)z->width, (float)z->height, jit[0], jit[1]};
     if (!MQ.par.buffer || memcmp(par_in, MQ.par_in, sizeof par_in)) {
         VkBuffer pbuf;
@@ -4070,6 +4080,160 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
             break;
         }
     if (t0) MO.ns_rec += kern_now_ns() - t1, MO.n_rec++;
+}
+
+// ---- reactive mask from alpha (FSR)
+// The Reactive mask is meant for alpha-blended objects, which write neither depth nor motion vectors (particles, smoke,
+// sparks, magic): FSR 3.1's guide asks the application to write each covered pixel's alpha into it. The alpha is only
+// known inside the game's own fragment shader, and the light target (R11G11B10F) has no alpha channel to read it back
+// from, so such a draw is recorded a second time, like the per-object motion draws above: the same vertex and fragment
+// shaders, the same descriptors, buffers, viewport (jittered like the scene's) and depth test, without depth writes,
+// into an R8 target cleared to 1. The blend there is dst * (1 - alpha) (source factor ZERO, destination factor
+// ONE_MINUS_SRC_ALPHA, red only), so the target ends up holding what is still see-through; dlaa_mv.comp turns that into
+// the mask (1 - target, at most DLAA_ALPHA_CAP, and none on the sky). A draw qualifies when it is drawn into the armed
+// light target (vk_dlaa_reactive_alpha), depth tested without depth writes, and its colour blend takes the shader's
+// alpha as the coverage: destination factor ONE_MINUS_SRC_ALPHA (blend and premultiplied blend), or source factor
+// SRC_ALPHA with destination ONE (additive scaled by alpha), equation ADD. Anything else is counted, by cause, in the log
+// line of vk_alphaobj_execute and is not in the mask: blends without an alpha factor (plain additive), line
+// loops, byte indices, indirect draws, and draws whose pipeline was still being built. Quads are taken (their generated
+// indices are reused). TOTK_FSR_ALPHA=0
+// turns the capture off (test).
+static struct {
+    uint64_t listed, indexed, plain;                                  // draws recorded in the list
+    uint64_t no_factor, no_test, writes_depth, feedback, quads, indirect, storage, building;   // seen, not listed
+    uint64_t dropped, ran, ran_draws;
+} AL;
+
+static int alpha_coverage_blend(const blend_st *b) {
+    if (b->eq_rgb != NVN_BLEND_EQUATION_ADD) return 0;
+    return b->dst_rgb == NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA ||
+           (b->src_rgb == NVN_BLEND_FUNC_SRC_ALPHA && b->dst_rgb == NVN_BLEND_FUNC_ONE);
+}
+
+// A draw that vk_dlaa_reactive_alpha accepted and the replay has just recorded: listed when it qualifies. count,
+// instances, first (no indices) or base_vertex and the index buffer (indices) are the draw's own.
+static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instances, uint32_t first,
+                        int32_t base_vertex, uint32_t base_instance, int itype, VkBuffer ib, VkDeviceSize ib_off) {
+    VkExecDraw *D = ex->draw;
+    const VkPipeState *os = &D->B.st;
+    const VkExecTarget *z = &ex->depth;
+    if (!D->B.st_valid || !os->fs || os->samples > 1 || os->raster_discard || z->format != VK_FORMAT_D32_SFLOAT) return;
+    if (!os->ds.dt) { AL.no_test++; return; }
+    if (os->ds.dw) { AL.writes_depth++; return; }
+    if (os->feedback) { AL.feedback++; return; }
+    if (!alpha_coverage_blend(&os->blend[0])) { AL.no_factor++; return; }
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != z->format) mo_begin(ex, frame);
+    VkPipeState ms = *os;
+    memset(ms.color_fmt, 0, sizeof ms.color_fmt);
+    ms.color_fmt[0] = NVN_FORMAT_R8;
+    ms.feedback = 0, ms.ms.a2c = 0;
+    ms.color.blend_en = 1, ms.color.logic_op = 0;   // target 0 only
+    ms.blend[0] = (blend_st){.target = 0, .src_rgb = NVN_BLEND_FUNC_ZERO, .dst_rgb = NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA,
+                             .src_a = NVN_BLEND_FUNC_ONE, .dst_a = NVN_BLEND_FUNC_ZERO, .eq_rgb = NVN_BLEND_EQUATION_ADD,
+                             .eq_a = NVN_BLEND_EQUATION_ADD};
+    ms.chmask.mask = 0x1;   // red of target 0
+    ms.ds.dw = 0, ms.ds.st = 0;   // the game's own depth test; nothing is written
+    static struct { VkPipeState st; const VkPipeInfo *info; int used; } pmemo[64];
+    uint64_t ph = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < sizeof ms; i += 8) {
+        uint64_t w8;
+        memcpy(&w8, (const uint8_t *)&ms + i, sizeof ms - i < 8 ? sizeof ms - i : 8);
+        ph = (ph ^ w8) * 0x100000001b3ull;
+    }
+    uint32_t pi = (uint32_t)(ph >> 58);
+    const VkPipeInfo *info = NULL;
+    VkPipeline pipe;
+    if (pmemo[pi].used && !memcmp(&pmemo[pi].st, &ms, sizeof ms)) {
+        info = pmemo[pi].info;
+        pipe = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);   // its optimised build once swapped in
+        if (!pipe) { AL.building++; return; }
+    } else {
+        int pending = 0;
+        pipe = vk_pipeline_graphics_async(&ms, &info, &pending, 0);
+        if (pending || !pipe || !info) { AL.building++; return; }
+        pmemo[pi].st = ms, pmemo[pi].info = info, pmemo[pi].used = 1;
+    }
+    MQ.d = mo_grow(MQ.d, &MQ.cap, MQ.n + 1, sizeof *MQ.d);
+    MoDraw *q = &MQ.d[MQ.n];
+    memset(mo_ovr, 0, sizeof mo_ovr);
+    mo_ovr_on = 0;   // the draw's own descriptors
+    if (!mo_desc(ex, info, q)) { AL.storage++; return; }
+    q->kind = MO_ALPHA, q->indexed = (uint8_t)indexed, q->first = first, q->cam = 0;
+    q->pipe = pipe, q->info = info;
+    if (!MQ.nst || memcmp(&MQ.st[MQ.nst - 1], &ms, sizeof ms)) {
+        MQ.st = mo_grow(MQ.st, &MQ.cst, MQ.nst + 1, sizeof *MQ.st);
+        MQ.st[MQ.nst++] = ms;
+    }
+    q->st = (uint32_t)MQ.nst - 1;
+    q->v = draw_viewport(ex), q->sc = vk_exec_scissor(ex);
+    q->bias[0] = ex->poly_offset.units, q->bias[1] = ex->poly_offset.clamp, q->bias[2] = ex->poly_offset.factor;
+    q->vb = mo_vertex_buffers(ex);
+    q->ib = ib, q->ib_off = ib_off;
+    q->it = itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+    q->count = count, q->instances = instances, q->base_vertex = base_vertex, q->base_instance = base_instance;
+    MQ.n++;
+    AL.listed++, indexed ? AL.indexed++ : AL.plain++;
+}
+
+// Called for every draw into a blend-enabled target 0 (the caller has checked that cheaply); what is not for the mask
+// returns at once. kind: 0 indexed draw (quads too), 1 draw without indices, 2 line loop or byte indices, 3 indirect.
+static void alpha_draw(VkExec *ex, int kind, uint32_t count, uint32_t instances, uint32_t first, int32_t base_vertex,
+                       uint32_t base_instance, int itype, VkBuffer ib, VkDeviceSize ib_off) {
+    VkExecDraw *D = ex->draw;
+    if (MO.failed || !D->B.st_valid || !vk_dlaa_reactive_alpha(ex)) return;
+    if (ex->chunked) plat_mutex_lock(&mo_lock);
+    if (kind == 2) AL.quads++;
+    else if (kind == 3) AL.indirect++;
+    else alpha_draw_(ex, kind == 0, count, instances, first, base_vertex, base_instance, itype, ib, ib_off);
+    if (ex->chunked) plat_mutex_unlock(&mo_lock);
+}
+
+// The list's alpha draws, recorded into target (R8, cleared to 1 by the caller) with the scene depth: 0 when the frame
+// has none. The motion draws stay in the list for vk_mvobj_execute.
+int vk_alphaobj_execute(VkExec *ex, VkImageView target, VkImageView depth, VkFormat depth_fmt, uint32_t w, uint32_t h) {
+    static uint64_t frames;
+    if (++frames % 600 == 0)
+        rt_log("vk_exec: reactive mask draws, in %llu frames: %llu recorded (%llu indexed, %llu without indices); not in the "
+               "mask: %llu blends without an alpha factor, %llu without depth test, %llu writing depth, %llu feedback, "
+               "%llu line loops or byte indices, %llu indirect, %llu with storage resources, %llu waiting for a pipeline; %llu "
+               "lists dropped; %llu passes, %.1f draws a pass", (unsigned long long)frames, (unsigned long long)AL.listed,
+               (unsigned long long)AL.indexed, (unsigned long long)AL.plain, (unsigned long long)AL.no_factor,
+               (unsigned long long)AL.no_test, (unsigned long long)AL.writes_depth, (unsigned long long)AL.feedback,
+               (unsigned long long)AL.quads, (unsigned long long)AL.indirect, (unsigned long long)AL.storage,
+               (unsigned long long)AL.building, (unsigned long long)AL.dropped, (unsigned long long)AL.ran,
+               AL.ran ? (double)AL.ran_draws / (double)AL.ran : 0.0);
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (!MQ.n || MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != depth_fmt) return 0;
+    static MoDraw *ab;
+    static int abcap;
+    int na = 0, kept = 0;
+    for (int i = 0; i < MQ.n; i++) na += MQ.d[i].kind == MO_ALPHA;
+    if (!na) return 0;
+    ab = mo_grow(ab, &abcap, na, sizeof *ab);
+    na = 0;
+    for (int i = 0; i < MQ.n; i++) {
+        if (MQ.d[i].kind == MO_ALPHA) ab[na++] = MQ.d[i];
+        else MQ.d[kept++] = MQ.d[i];
+    }
+    MQ.n = kept;
+    VkCommandBuffer cb = ex->cb;
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = target,
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingAttachmentInfo da = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = depth,
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca, .pDepthAttachment = &da};
+    vkCmdBeginRendering(cb, &ri);
+    mo_emit_range(cb, ab, na);
+    vkCmdEndRendering(cb);
+    vk_exec_draw_new_cb(ex);
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    ex->recorded += na;
+    AL.ran++, AL.ran_draws += (uint64_t)na;
+    return na;
 }
 
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,
@@ -4172,12 +4336,13 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
     return 1;
 }
 
-static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
+static VkDescriptorBufferInfo bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
     VkBuffer b;
     VkDeviceSize o;
     MX_CPY(scratch(ex, bytes, &b, &o), data, bytes);
     vkCmdBindIndexBuffer(ex->cb, b, o, type);
     ex->recorded++;
+    return (VkDescriptorBufferInfo){b, o, bytes};   // where the generated indices are (the reactive mask's draw reuses them)
 }
 
 static void op_draw(VkExec *ex, const p_draw *d) {
@@ -4194,9 +4359,13 @@ static void op_draw(VkExec *ex, const p_draw *d) {
             uint32_t v = first + 4 * i, k[6] = {0, 1, 2, 0, 2, 3};
             for (int j = 0; j < 6; j++) ix[6 * i + j] = v + k[j];
         }
-        bind_index(ex, ix, sizeof *ix * 6 * q, VK_INDEX_TYPE_UINT32);
+        VkDescriptorBufferInfo qb = bind_index(ex, ix, sizeof *ix * 6 * q, VK_INDEX_TYPE_UINT32);
         free(ix);
         vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, 0, (uint32_t)d->base_instance);
+        if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw): the quads' own generated indices
+            alpha_draw(ex, 0, 6 * q, inst, 0, 0, (uint32_t)d->base_instance, NVN_INDEX_TYPE_UNSIGNED_INT, qb.buffer, qb.offset);
+        ex->recorded++;
+        return;
     } else if (d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && n >= 2) {   // a strip that returns to its first vertex
         uint32_t *ix = malloc(sizeof *ix * (n + 1));
         if (!ix) rt_fatal("vk: out of memory");
@@ -4207,7 +4376,12 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
+        if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw)
+            alpha_draw(ex, 1, n, inst, first, 0, (uint32_t)d->base_instance, 0, VK_NULL_HANDLE, 0);
+        ex->recorded++;
+        return;
     }
+    if (D->B.st.color.blend_en & 1) alpha_draw(ex, 2, n, inst, first, 0, 0, 0, VK_NULL_HANDLE, 0);   // line loops: counted only
     ex->recorded++;
 }
 
@@ -4266,6 +4440,10 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
                      (uint32_t)d->base_instance);
     ex->recorded++;
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
+    if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw)
+        alpha_draw(ex, d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE ? 2 : 0, (uint32_t)d->count,
+                   d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex, (uint32_t)d->base_instance, d->itype,
+                   sp.buffer, sp.offset);
 }
 
 // DrawElementsIndirect: the arguments are read by the GPU from the pool buffer (they are often written by an earlier
@@ -4287,6 +4465,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
+    if (D->B.st.color.blend_en & 1) alpha_draw(ex, 3, 0, 0, 0, 0, 0, 0, VK_NULL_HANDLE, 0);   // counted only
     ex->recorded += 2;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
     VK_MEM_BOUND(ip);

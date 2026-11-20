@@ -36,10 +36,13 @@ void vk_ffx_device_exts(const VkExtensionProperties *have, uint32_t nhave, const
 }
 void vk_ffx_init(void) {}
 int vk_ffx_available(void) { return 0; }
-void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
-    (void)max_w, (void)max_h, (void)ow, (void)oh, (void)depth_inverted, (void)depth_infinite;
+void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite,
+                    int debug_view) {
+    (void)max_w, (void)max_h, (void)ow, (void)oh, (void)depth_inverted, (void)depth_infinite, (void)debug_view;
     return NULL;
 }
+int vk_ffx_debug_matches(const void *ctx, int debug_view) { return (void)ctx, (void)debug_view, 1; }
+int vk_ffx_uses_transparency(const void *ctx) { return (void)ctx, 0; }
 int vk_ffx_fits(const void *ctx, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     return (void)ctx, (void)w, (void)h, (void)ow, (void)oh, 0;
 }
@@ -106,6 +109,8 @@ struct FfxCtx {
     ffxContext ctx;
     uint32_t max_w, max_h, ow, oh;
     int depth_inverted, depth_infinite;
+    int debug_view;                         // TODO(debug-view): made with FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION
+    int debug_logged;                       // TODO(debug-view): the first Debug view dispatch was logged
     int uses_reactive, uses_transparency;   // optional inputs the upscaler takes (resource requirements)
     int needs_reactive;                     // it lists the reactive mask as required, not optional
     int warned_reactive;                    // the missing required mask was logged
@@ -256,7 +261,8 @@ static void query_requirements(struct FfxCtx *fc) {
            fc->uses_transparency ? "used" : "not used");
 }
 
-void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite) {
+void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, int depth_inverted, int depth_infinite,
+                    int debug_view) {
     if (!F.available) return NULL;
     struct ffxOverrideVersion ov = {.header = {FFX_API_DESC_TYPE_OVERRIDE_VERSION, NULL}, .versionId = F.version_id};
     struct ffxCreateContextDescUpscaleVersion ver = {
@@ -271,6 +277,7 @@ void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, in
     if (depth_inverted) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     if (depth_infinite) flags |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     if (rt_knob("FSR_DEBUG", "0")) flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;   // TOTK_FSR_DEBUG=1: API checks
+    if (debug_view) flags |= FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;   // TODO(debug-view)
     struct ffxCreateContextDescUpscale cd = {.header = {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &be.header},
                                              .flags = flags, .maxRenderSize = {max_w, max_h},
                                              .maxUpscaleSize = {ow, oh}, .fpMessage = on_message};
@@ -284,6 +291,7 @@ void *vk_ffx_create(uint32_t max_w, uint32_t max_h, uint32_t ow, uint32_t oh, in
     }
     fc->max_w = max_w, fc->max_h = max_h, fc->ow = ow, fc->oh = oh;
     fc->depth_inverted = depth_inverted != 0, fc->depth_infinite = depth_infinite != 0;
+    fc->debug_view = debug_view != 0;
     for (size_t i = 0; i < NCONSTANTS; i++) fc->applied[i] = NAN;   // a new context starts with the upscaler's own values
     query_requirements(fc);
     struct ffxQueryGetProviderVersion pv = {.header = {FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, NULL}};
@@ -306,6 +314,16 @@ int vk_ffx_depth_matches(const void *ctx, int depth_inverted, int depth_infinite
 int vk_ffx_uses_reactive(const void *ctx) {
     const struct FfxCtx *fc = ctx;
     return !fc || fc->uses_reactive;
+}
+
+int vk_ffx_uses_transparency(const void *ctx) {   // TODO(debug-view)
+    const struct FfxCtx *fc = ctx;
+    return fc && fc->uses_transparency;
+}
+
+int vk_ffx_debug_matches(const void *ctx, int debug_view) {   // TODO(debug-view)
+    const struct FfxCtx *fc = ctx;
+    return !fc || fc->debug_view == (debug_view != 0);
 }
 
 void vk_ffx_release(void *ctx) {
@@ -434,6 +452,14 @@ int vk_ffx_dispatch(void *ctx, VkCommandBuffer cb, const VkFfxDispatch *d) {
     u.frameTimeDelta = d->dt_ms;
     u.preExposure = 1.0f;
     u.reset = d->reset != 0;
+    if (d->debug_view && fc->debug_view) {   // TODO(debug-view)
+        u.flags |= FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
+        if (!fc->debug_logged) {
+            fc->debug_logged = 1;
+            rt_log("fsr: Debug view requested at dispatch (context made with FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION, flags %#x)",
+                   (unsigned)u.flags);
+        }
+    }
     camera_range(fc, d->cam_near, d->cam_far, &u.cameraNear, &u.cameraFar);
     u.cameraFovAngleVertical = d->fov_y;
     u.viewSpaceToMetersFactor = 1.0f;   // TotK's world units are metres

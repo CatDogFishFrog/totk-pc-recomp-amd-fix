@@ -158,8 +158,8 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   The scene's share for each mode is FSR's own ratio (1.5, 1.7, 2.0, 3.0:1; only Balanced differs from DLSS's, 1/1.7 against
   0.58). After creating a context `vk_ffx.c` asks the upscaler which inputs it requires or takes
   (`ffxQueryDescUpscaleGetResourceRequirements`): where the reactive mask is not among them `vk_dlaa.c` skips the class
-  mask, the reactive mask pass and its copy of the light target (`reactive_wanted`), and the reactive and the transparency
-  and composition mask are handed over only where the context takes them. `ffxConfigure` sets FSR 3.1's constants from
+  mask, the alpha draws, the reactive mask pass and its copy of the light target (`reactive_wanted`). The reactive mask is
+  handed over only where the context takes it; the transparency and composition mask is not supplied at all (docs/dlaa.md). `ffxConfigure` sets FSR 3.1's constants from
   the `fsr_velocity_factor`, `fsr_reactiveness_scale`, `fsr_shading_change_scale`, `fsr_accumulation` and
   `fsr_min_disocclusion` settings when they are set.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.

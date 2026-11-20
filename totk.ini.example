@@ -293,7 +293,8 @@
 # Characters' trails: where a character, animal or held item moves without motion vectors of its own (all of them with
 # dlaa_objmv = 0), DLSS can drag a faint copy of it. The G-buffer marks those objects; on them and where they were the
 # frame before, DLSS is told to favour the current frame by this percentage (0, 35, 65 or 100; 0 off). Higher removes
-# more of the trails and leaves those edges a little less smooth. Changes while the game runs take effect at once.
+# more of the trails and leaves those edges a little less smooth. FSR takes at most 90 (a value of 1 would take its history
+# off those pixels entirely). Changes while the game runs take effect at once.
 # dlss_char_mask = 65
 # NVIDIA Reflex Low Latency (NVIDIA GPUs supporting VK_NV_low_latency2): off, on, or boost.
 # Reduces system input latency; boost keeps GPU clocks high in CPU-bound scenes. Read at start.

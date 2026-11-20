@@ -29,7 +29,9 @@
 #include "vk_exec.h"
 #include "vk_ffx.h"
 #include "vk_rec.h"
+#include "dlaa_debug.h"   // TODO(debug-view)
 #include "dlaa_mv_spv.h"
+#include "dlaa_view_spv.h"   // TODO(debug-view): made by tools/build_shaders.py from shaders/dlaa_view.comp
 
 typedef int NgxResult;   // NVSDK_NGX_Result: 1 success, 0xBAD00000 | n failures
 #define NGX_OK(r) (((unsigned)(r) & 0xFFF00000u) != 0xBAD00000u)
@@ -301,6 +303,9 @@ static struct {
         VkImage mask, chars[2];  // the bias mask DLSS reads, the character class mask of this and last frame (R8)
         VmaAllocation mask_mem, chars_mem[2];
         VkImageView mask_view, chars_view[2];
+        VkImage alpha;           // FSR: what is still see-through after the alpha-blended draws (R8, 1 = untouched), see mv_pass
+        VmaAllocation alpha_mem;
+        VkImageView alpha_view;
         int chars_cur, chars_ok; // chars[chars_cur] is written next; chars_ok: the other holds last frame's
         NgxHandle *feat;         // DLSS only: FSR's one context is D.fx, whatever the size
         uint64_t used;           // evals count when it last ran
@@ -392,6 +397,8 @@ static void free_size(struct Size *e) {
     if (e->mv) vmaDestroyImage(c->vma, e->mv, e->mv_mem);
     if (e->mask_view) vkDestroyImageView(c->device, e->mask_view, NULL);
     if (e->mask) vmaDestroyImage(c->vma, e->mask, e->mask_mem);
+    if (e->alpha_view) vkDestroyImageView(c->device, e->alpha_view, NULL);
+    if (e->alpha) vmaDestroyImage(c->vma, e->alpha, e->alpha_mem);
     for (int i = 0; i < 2; i++) {
         if (e->chars_view[i]) vkDestroyImageView(c->device, e->chars_view[i], NULL);
         if (e->chars[i]) vmaDestroyImage(c->vma, e->chars[i], e->chars_mem[i]);
@@ -422,11 +429,13 @@ static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_
         !image2d(w, h, VK_FORMAT_R16G16_SFLOAT, u | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, &e->mv, &e->mv_mem, &e->mv_view) ||
         !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->mask, &e->mask_mem, &e->mask_view) ||
         !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[0], &e->chars_mem[0], &e->chars_view[0]) ||
-        !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[1], &e->chars_mem[1], &e->chars_view[1]))
+        !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[1], &e->chars_mem[1], &e->chars_view[1]) ||
+        !image2d(w, h, VK_FORMAT_R8_UNORM, u8 | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                 &e->alpha, &e->alpha_mem, &e->alpha_view))
         return NULL;
-    VkImageMemoryBarrier2 ib[5];
-    VkImage im[5] = {e->out, e->mv, e->mask, e->chars[0], e->chars[1]};
-    for (int i = 0; i < 5; i++)
+    VkImageMemoryBarrier2 ib[6];
+    VkImage im[6] = {e->out, e->mv, e->mask, e->chars[0], e->chars[1], e->alpha};
+    for (int i = 0; i < 6; i++)
         ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -435,7 +444,7 @@ static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_
                                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im[i],
                                         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 5,
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 6,
                            .pImageMemoryBarriers = ib};
     vkCmdPipelineBarrier2(cb, &di);
     e->w = w, e->h = h, e->ow = ow, e->oh = oh;
@@ -530,11 +539,15 @@ static void times_begin(VkCommandBuffer cb) {
 #define CAM_SLOT 0xa00u    // camb slot stride
 #define MVM_SLOTS 16u      // frames the GPU may still be reading the reprojection blocks of
 
+// The most the alpha draws put into the reactive mask (FSR's own advice for a reactive value: not 1.0, which would take the
+// history off entirely); the characters' mask has its own (char_bias).
+#define DLAA_ALPHA_CAP 0.9f
+
 static int mv_init(void) {
     if (D.mv_ok >= 0) return D.mv_ok;
     D.mv_ok = 0;
     const VkCtx *c = vk_ctx();
-    VkDescriptorSetLayoutBinding b[8] = {
+    VkDescriptorSetLayoutBinding b[9] = {
         {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -542,11 +555,12 @@ static int mv_init(void) {
         {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 8, .pBindings = b};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+                                           .bindingCount = 9, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
                               .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                               .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
@@ -619,7 +633,7 @@ static int inv4(const double m[16], double o[16]) {
 // The pass, recorded through the recorder like the replay's own commands. 0: no camera this frame (the vectors stay
 // zero and DLSS starts a new history). bias > 0 with this frame's G-buffer classes (D.ids) also writes e->mask, the
 // bias mask (dlaa_mv.comp); *masked says whether it did.
-static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float jy, float bias, int *masked) {
+static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float jy, float bias, int alpha_on, int *masked) {
     *masked = 0;
     VkCommandBuffer cb = ex->cb;
     uint32_t w = e->w, h = e->h;
@@ -679,7 +693,18 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     VkDescriptorImageInfo mki = {VK_NULL_HANDLE, e->mask_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo cpi = {VK_NULL_HANDLE, e->chars_view[cur_c ^ 1], VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo coi = {VK_NULL_HANDLE, e->chars_view[cur_c], VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr[8] = {
+    // The reactive mask's alpha draws (FSR, vk_exec_draw.c alpha_draw): into e->alpha, cleared to 1, over the scene depth
+    int alpha_used = 0;
+    if (alpha_on) {
+        VkClearColorValue one = {{1, 1, 1, 1}};
+        VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, e->alpha, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &all);
+        full_barrier(cb);
+        alpha_used = vk_alphaobj_execute(ex, e->alpha_view, zv, D.depth.format, w, h) > 0;
+        full_barrier(cb);
+    }
+    VkDescriptorImageInfo ali = {D.mv_samp, e->alpha_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[9] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &zi},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
@@ -695,12 +720,15 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 6, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &cpi},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 7, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &coi}};
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &coi},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 8, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ali}};
     times_begin(cb);
     times_mark(cb, T_MV0);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.mv_pipe);
-    rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.mv_layout, 0, 8, wr);
-    float pc[6] = {(float)w, (float)h, jx, jy, use ? bias : 0.0f, use && e->chars_ok ? 1.0f : 0.0f};
+    rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.mv_layout, 0, 9, wr);
+    float pc[8] = {(float)w, (float)h, jx, jy, use ? bias : 0.0f, use && e->chars_ok ? 1.0f : 0.0f,
+                   alpha_used ? 1.0f : 0.0f, DLAA_ALPHA_CAP};
     vkCmdPushConstants(cb, D.mv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     full_barrier(cb);
@@ -716,7 +744,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     D.mv_frames++;
     if (use) e->chars_cur ^= 1, e->chars_ok = 1, D.masked++;
     else e->chars_ok = 0;
-    *masked = use;
+    *masked = use || alpha_used;
     return 1;
 }
 
@@ -903,6 +931,21 @@ static int ended_at(const VkExec *ex) {
     return !ex->chunked || ex->fence != D.end_fence || ex->pos >= D.end_pos;
 }
 
+// TOTK_FSR_ALPHA=0 (test): no alpha draws for the reactive mask.
+static int alpha_capture(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("FSR_ALPHA", "1");
+    return on;
+}
+
+// vk_exec_draw.c, for each draw into a blend-enabled target 0: 1 when it is drawn into the armed scene targets and the
+// FSR context takes a reactive mask, so that the draw may go into it (alpha_draw lists the ones that qualify).
+int vk_dlaa_reactive_alpha(const VkExec *ex) {
+    if (!alpha_capture() || !fsr_backend() || !dl_active() || !D.armed || ended_at(ex)) return 0;
+    if (!ex->color[0].image || ex->color[0].image != D.color.image || ex->depth.image != D.depth.image) return 0;
+    return reactive_wanted();
+}
+
 // The viewport and scissor of the scene's draws against the render area and the depth target they draw into, logged once
 // for each distinct combination (eight at most). The render resolution the upscaler gets is the size of the light target
 // (evaluate), so a viewport or a scissor smaller than the target would leave edge pixels that it reads undrawn.
@@ -1023,7 +1066,8 @@ static int preset_value(void) {
 static float char_bias(void) {
     const char *v = cfg_get("TOTK_DLSS_CHAR_MASK");
     long n = v && *v ? strtol(v, NULL, 10) : 65;
-    return n <= 0 ? 0.0f : n >= 100 ? 1.0f : (float)n / 100.0f;
+    float top = fsr_backend() ? 0.9f : 1.0f;   // FSR: below 1, which would take its history off those pixels entirely
+    return n <= 0 ? 0.0f : n >= 100 ? top : (float)n / 100.0f < top ? (float)n / 100.0f : top;
 }
 
 // The quality setting DLSS is created with, from the scene's share of the output width.
@@ -1105,13 +1149,16 @@ static void cam_params(float *cn, float *cf, float *fov, int *inv, int *inf) {
 // images by it, so a scene that stays at 50 % of the output does not pay for 100 %, and a larger one later costs one
 // new context, after which the maximum holds. The context is replaced, with a new history, when
 //  - the output size changed, or a scene larger than the maximum appeared (vk_ffx_fits); or
+//  - the Debug view was switched on or off (TODO(debug-view): a creation flag of FSR 3.1's Debug view); or
 //  - the camera's depth convention, a creation flag, has differed for FFX_DEPTH_SETTLE frames in a row: the title
 //    screen and the game project depth differently (cam_params). The maximum stays.
-static void *fsr_context(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int inv, int inf) {
+static void *fsr_context(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int inv, int inf, int debug_view) {
     void *c = D.fx.ctx;
     const char *why = NULL;
     if (c && !vk_ffx_fits(c, w, h, ow, oh)) {
         why = "the scene or output size outgrew it";
+    } else if (c && !vk_ffx_debug_matches(c, debug_view)) {   // TODO(debug-view): a creation flag of FSR 3.1's Debug view
+        why = "the Debug view was switched";
     } else if (c && !vk_ffx_depth_matches(c, inv, inf)) {
         if (++D.fx.diff >= FFX_DEPTH_SETTLE) why = "the depth convention changed";
     } else {
@@ -1126,11 +1173,204 @@ static void *fsr_context(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int i
     if (!c) {
         uint32_t mw = w, mh = h;   // for a new output, this scene; for the same one, no smaller than before
         if (D.fx.ow == ow && D.fx.oh == oh) mw = mw > D.fx.mw ? mw : D.fx.mw, mh = mh > D.fx.mh ? mh : D.fx.mh;
-        c = D.fx.ctx = vk_ffx_create(mw, mh, ow, oh, inv, inf);
+        c = D.fx.ctx = vk_ffx_create(mw, mh, ow, oh, inv, inf, debug_view);
         D.fx.diff = 0;
         if (c) D.fx.ow = ow, D.fx.oh = oh, D.fx.mw = mw, D.fx.mh = mh, D.reset = 1;
     }
     return c;
+}
+
+
+// ---------------------------------------------------------------- Debug view (TODO(debug-view): remove after the tests)
+// Part A: FSR 3.1's own Debug view (FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW at the dispatch, and the context made with
+// FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION): FSR draws its internal surfaces over the upscaled picture. Part B: the inputs
+// this project hands to FSR, one tile each, drawn over the upscaled picture by dlaa_view.comp after FSR's dispatch.
+// Nothing here makes a tile up: an input that was not supplied is black and its label says so, and a label is published
+// only for a debug picture that was recorded. The state is set from the Video tab of the menu (dlaa_debug.h).
+static struct {
+    int mode, color, view;           // atomics: the menu thread writes, evaluate reads
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    int ok;                          // -1 not built, 0 failed, 1 ready
+    int seq;                         // seqlock over labels and n: odd while evaluate writes
+    DlaaDebugLabel labels[16];
+    int n;
+    uint64_t stamp_ns;               // plat_now_ns when they were published
+    int logged_mode, logged_color, logged_view;   // the last state logged
+} V = {.ok = -1, .logged_mode = -1, .logged_color = -1, .logged_view = -1};
+
+int dlaa_debug_mode(void) { return __atomic_load_n(&V.mode, __ATOMIC_RELAXED); }
+int dlaa_debug_color(void) { return __atomic_load_n(&V.color, __ATOMIC_RELAXED); }
+int dlaa_debug_view(void) { return __atomic_load_n(&V.view, __ATOMIC_RELAXED); }
+void dlaa_debug_set(int mode, int color, int view) {
+    __atomic_store_n(&V.mode, mode < 0 || mode > DLAA_DEBUG_BOTH ? 0 : mode, __ATOMIC_RELAXED);
+    __atomic_store_n(&V.color, color < 0 || color > DLAA_DEBUG_COLOR_BOTH ? 0 : color, __ATOMIC_RELAXED);
+    __atomic_store_n(&V.view, view < 0 || view >= DLAA_DEBUG_VIEWS ? 0 : view, __ATOMIC_RELAXED);
+}
+int dlaa_debug_available(void) { return vk_dlaa_fsr_on(); }
+
+int dlaa_debug_labels(DlaaDebugLabel *out, int max) {
+    for (int tries = 0; tries < 4; tries++) {
+        int s0 = __atomic_load_n(&V.seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1) continue;
+        int n = V.n < max ? V.n : max;
+        uint64_t at = V.stamp_ns;
+        for (int i = 0; i < n; i++) out[i] = V.labels[i];
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&V.seq, __ATOMIC_RELAXED) != s0) continue;
+        return at && plat_now_ns() - at < 250000000ull ? n : 0;   // not drawn for a while: nothing to label
+    }
+    return 0;
+}
+
+static void debug_publish(const DlaaDebugLabel *l, int n) {
+    __atomic_fetch_add(&V.seq, 1, __ATOMIC_ACQ_REL);
+    for (int i = 0; i < n; i++) V.labels[i] = l[i];
+    V.n = n, V.stamp_ns = plat_now_ns();
+    __atomic_fetch_add(&V.seq, 1, __ATOMIC_RELEASE);
+}
+
+// FSR 3.1 has the Debug view; FSR 4 (a GPU that offers it) has no such thing.
+static int debug_fsr_v3(void) { return !strncmp(vk_ffx_version(), "FSR 3.", 6); }
+
+// The labels of FSR's Debug view, as the schema of the reference shows it: three tiles in the top row, three in the bottom
+// row, the upscaled frame in the band between. The tile rectangles are fractions of the picture; the real ones are
+// checked against the first screenshot (docs/fsr-debug-view.md of the plan).
+// with_frame 0: the band between the rows is taken by the inputs (mode DLAA_DEBUG_BOTH).
+static int debug_labels_a(DlaaDebugLabel *l, int with_frame) {
+    static const struct { const char *name; float x, y; } t[] = {
+        {"Dilated Motion Vectors", 0.0f / 3, 0.0f}, {"Protected Areas", 1.0f / 3, 0.0f},
+        {"Dilated Depth", 2.0f / 3, 0.0f},          {"Disocclusion mask", 0.0f / 3, 2.0f / 3},
+        {"Reactiveness", 1.0f / 3, 2.0f / 3},       {"Detail Protection Takedown", 2.0f / 3, 2.0f / 3}};
+    int n = 0;
+    for (int i = 0; i < 6; i++) l[n++] = (DlaaDebugLabel){t[i].name, t[i].x, t[i].y, 1.0f / 3, 1.0f / 3};
+    if (with_frame) l[n++] = (DlaaDebugLabel){"Upscaled frame", 0.0f, 1.0f / 3, 1.0f, 1.0f / 3};
+    return n;
+}
+
+enum { DV_REACTIVE, DV_TRANSP, DV_MV, DV_DEPTH, DV_COLOR };
+static const char *const dv_names[] = {"Reactive mask (input)", "T&C mask (input)", "Motion vectors (input)",
+                                       "Depth buffer (input)", "Color buffer (input)"};
+static const char *const dv_names_none[] = {"Reactive mask (input): not supplied", "T&C mask (input): not supplied"};
+
+struct DvTile {
+    float x, y, w, h;   // fractions of the picture
+    int kind, split;    // dlaa_view.comp
+};
+
+// The tiles of the inputs view (mode DLAA_DEBUG_INPUTS: the whole picture, 2 x 2; DLAA_DEBUG_BOTH: the band between
+// FSR's rows, four in a row; a single view takes the whole area) and their labels (a tile cut in two has two). have[kind]: the input was supplied to FSR.
+static int debug_layout_b(int mode, int color, int view, const int have[4], struct DvTile *tile, DlaaDebugLabel *l,
+                          int *nl) {
+    float ax = 0, ay = 0, aw = 1, ah = 1;
+    int cols = 2, rows = 2;
+    if (mode == DLAA_DEBUG_BOTH) ay = 1.0f / 3, ah = 1.0f / 3, cols = 4, rows = 1;
+    int nt = 0;
+    *nl = 0;
+    if (color == DLAA_DEBUG_COLOR_ONLY) {
+        tile[nt++] = (struct DvTile){ax, ay, aw, ah, DV_COLOR, 1};
+        l[(*nl)++] = (DlaaDebugLabel){dv_names[DV_COLOR], ax, ay, aw, ah};
+        return nt;
+    }
+    // view: one buffer over the whole area, or the grid of all four
+    int first = view > 0 ? view - 1 : 0, last = view > 0 ? view - 1 : 3;
+    if (view > 0) cols = rows = 1;
+    for (int k = first; k <= last; k++) {
+        int c = view > 0 ? 0 : k;
+        float x = ax + aw * (c % cols) / cols, y = ay + ah * (c / cols) / rows, w = aw / cols, h = ah / rows;
+        int split = color == DLAA_DEBUG_COLOR_BOTH ? 2 : 0;
+        tile[nt++] = (struct DvTile){x, y, w, h, k, split};
+        const char *name = have[k] ? dv_names[k] : dv_names_none[k];   // only the two masks can be missing
+        if (split) {
+            l[(*nl)++] = (DlaaDebugLabel){name, x, y, w / 2, h};
+            l[(*nl)++] = (DlaaDebugLabel){dv_names[DV_COLOR], x + w / 2, y, w / 2, h};
+        } else {
+            l[(*nl)++] = (DlaaDebugLabel){name, x, y, w, h};
+        }
+    }
+    return nt;
+}
+
+static int debug_view_init(void) {
+    if (V.ok >= 0) return V.ok;
+    V.ok = 0;
+    const VkCtx *c = vk_ctx();
+    VkDescriptorSetLayoutBinding b[6];
+    for (uint32_t i = 0; i < 6; i++)
+        b[i] = (VkDescriptorSetLayoutBinding){i, i < 5 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                              1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = 6, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof dlaa_view_spv,
+                                   .pCode = dlaa_view_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, &V.dsl) != VK_SUCCESS) goto fail;
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &V.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    if (vkCreatePipelineLayout(c->device, &li, NULL, &V.layout) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS)
+        goto fail;
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = V.layout};
+    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &V.pipe);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (r != VK_SUCCESS) goto fail;
+    return V.ok = 1;
+fail:
+    rt_log("dlaa: the Debug view's inputs pass could not be set up: no inputs view");
+    return 0;
+}
+
+// Draws the inputs view into e->out (after FSR's dispatch, before the result is copied on) and publishes its labels,
+// together with FSR's own (labels_a, n_a) where both parts are on. mask_view: the Reactive mask handed to FSR (NULL: none).
+static void debug_inputs(VkCommandBuffer cb, struct Size *e, VkImageView cv, VkImageView zv, VkImageView mask_view,
+                         int transp_given, int mode, int color, int view, DlaaDebugLabel *labels_a, int n_a, float cn, float cf,
+                         int inv, int inf) {
+    if (!D.mv_samp || debug_view_init() <= 0) return;
+    int have[4] = {mask_view != VK_NULL_HANDLE, transp_given, 1, 1};
+    struct DvTile tile[4];
+    DlaaDebugLabel lab[16];
+    int nl = 0, nt = debug_layout_b(mode, color, view, have, tile, lab, &nl);
+    // the stand-in where an input was not supplied is never read (the shader draws black for present = 0)
+    VkImageView rv = mask_view ? mask_view : e->mask_view;
+    VkDescriptorImageInfo ri = {D.mv_samp, rv, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ti = {D.mv_samp, rv, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo mi = {D.mv_samp, e->mv_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo zi = {D.mv_samp, zv, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ci = {D.mv_samp, cv, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo oi = {VK_NULL_HANDLE, e->out_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[6];
+    const VkDescriptorImageInfo *info[6] = {&ri, &ti, &mi, &zi, &ci, &oi};
+    for (uint32_t i = 0; i < 6; i++)
+        wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+                                       .descriptorType = i < 5 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                               : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       .pImageInfo = info[i]};
+    full_barrier(cb);   // FSR's output is complete, the inputs are as they were
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.pipe);
+    rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.layout, 0, 6, wr);
+    if (!(cn > 0)) cn = 0.1f;
+    for (int i = 0; i < nt; i++) {
+        int x0 = (int)(tile[i].x * e->ow + 0.5f), y0 = (int)(tile[i].y * e->oh + 0.5f);
+        int x1 = (int)((tile[i].x + tile[i].w) * e->ow + 0.5f), y1 = (int)((tile[i].y + tile[i].h) * e->oh + 0.5f);
+        int present = tile[i].kind < 2 ? have[tile[i].kind] : 1;
+        int pc[12] = {x0, y0, x1 - x0, y1 - y0, tile[i].kind, tile[i].split, present, inv};
+        memcpy(&pc[8], &cn, 4), memcpy(&pc[9], &cf, 4);
+        pc[10] = inf, pc[11] = 0;
+        vkCmdPushConstants(cb, V.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cb, (uint32_t)(x1 - x0 + 7) / 8, (uint32_t)(y1 - y0 + 7) / 8, 1);
+    }
+    full_barrier(cb);
+    DlaaDebugLabel all[16];
+    int n = 0;
+    for (int i = 0; i < n_a && n < 16; i++) all[n++] = labels_a[i];
+    for (int i = 0; i < nl && n < 16; i++) all[n++] = lab[i];
+    debug_publish(all, n);
 }
 
 // dst: the target DLSS's picture goes to, NULL for the light target itself (DLAA in place).
@@ -1165,7 +1405,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // TOTK_DLAA_MV=0: zero motion (test)
     int masked = 0, want_mask = reactive_wanted();
-    if (no_mv || !mv_pass(ex, e, zv, jx, jy, want_mask ? char_bias() : 0.0f, &masked)) {
+    if (no_mv || !mv_pass(ex, e, zv, jx, jy, want_mask ? char_bias() : 0.0f, fsr && want_mask && alpha_capture(), &masked)) {
         VkClearColorValue zero = {{0, 0, 0, 0}};
         VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, e->mv, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
@@ -1190,7 +1430,17 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         float cn, cf, fov;
         int inv, inf;
         cam_params(&cn, &cf, &fov, &inv, &inf);
-        void *fx = fsr_context(w, h, ow, oh, inv, inf);   // a new one starts a new history (D.reset)
+        // TODO(debug-view): the Debug view (part A needs FSR 3.1: FSR 4 has none) and the inputs view (part B)
+        int dm = dlaa_debug_mode(), dc = dlaa_debug_color(), dv = dlaa_debug_view();
+        int dbg_a = (dm == DLAA_DEBUG_FSR || dm == DLAA_DEBUG_BOTH) && debug_fsr_v3();
+        int dbg_b = dm == DLAA_DEBUG_INPUTS || dm == DLAA_DEBUG_BOTH;
+        if (dm != V.logged_mode || dc != V.logged_color || dv != V.logged_view) {
+            V.logged_mode = dm, V.logged_color = dc, V.logged_view = dv;
+            rt_log("dlaa: debug view mode %d, color %d, view %d (FSR Debug view %s, inputs view %s)", dm, dc, dv,
+                   dbg_a ? "on" : (dm == DLAA_DEBUG_FSR || dm == DLAA_DEBUG_BOTH) ? "needs FSR 3.1: off" : "off",
+                   dbg_b ? "on" : "off");
+        }
+        void *fx = fsr_context(w, h, ow, oh, inv, inf, dbg_a);   // a new one starts a new history (D.reset)
         if (!fx) return dl_fail("FSR context creation", 0);
         if (D.last_color != t->image) D.reset = 1, D.why[2]++, D.last_color = t->image;
         // FSR sharpens its own output (sharpness, the setting the FSR 1 present pass reads too): the game's sharpening
@@ -1202,18 +1452,32 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
                             .mv = {e->mv, VK_FORMAT_R16G16_SFLOAT, w, h},
                             .out = {e->out, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh},
                             .jx = jx, .jy = jy, .dt_ms = dt_ms, .cam_near = cn, .cam_far = cf, .fov_y = fov,
-                            .sharpness = (float)sharp / 100.0f, .reset = D.reset};
-        if (mk) fd.reactive = (VkFfxImage){mk->mask, VK_FORMAT_R8_UNORM, w, h};
-        else if (masked) fd.reactive = (VkFfxImage){e->mask, VK_FORMAT_R8_UNORM, w, h};
-        // TOTK_FSR_TRANSPARENCY=1 (a test, FSR 3.1): the same mask also as the transparency and composition mask, which
-        // takes the history's protection off those pixels. vk_ffx_dispatch passes it only where the context takes it.
-        static int transp = -1;
-        if (transp < 0) transp = rt_knob("FSR_TRANSPARENCY", "0");
-        if (transp) fd.transparency = fd.reactive;
+                            .sharpness = dbg_a ? 0.0f : (float)sharp / 100.0f,   // the Debug view is read unsharpened
+                            .reset = D.reset, .debug_view = dbg_a};
+        // Reactive mask: e->mask, what mv_pass wrote (the characters' class mask and the alpha of the alpha-blended draws).
+        // Transparency and composition mask: none. No source for it is implemented, and none is made up: fd.transparency
+        // stays empty and vk_ffx_dispatch hands FSR nothing there (docs/dlaa.md).
+        if (masked) fd.reactive = (VkFfxImage){e->mask, VK_FORMAT_R8_UNORM, w, h};
+        static int tc_logged;
+        if (!tc_logged++)
+            rt_log("fsr: transparency and composition mask: not supplied (no source for it is implemented)");
         c0 = timed ? kern_now_ns() : 0;
         int ok = vk_ffx_dispatch(fx, cb, &fd);
         if (timed) T.cpu_ngx += kern_now_ns() - c0;
         if (!ok) return dl_fail("FSR dispatch", 0);
+        if (dbg_a || dbg_b) {   // TODO(debug-view)
+            DlaaDebugLabel la[8];
+            int na = dbg_a ? debug_labels_a(la, dm != DLAA_DEBUG_BOTH) : 0;
+            if (dbg_b) {
+                VkImageView rv = masked ? e->mask_view : VK_NULL_HANDLE;
+                if (!vk_ffx_uses_reactive(fx)) rv = VK_NULL_HANDLE;   // the context does not take it: not supplied
+                debug_inputs(cb, e, cv, zv, rv, 0,
+                             dbg_a ? dm : DLAA_DEBUG_INPUTS, dc, dv, la, na,
+                             cn, cf, inv, inf);
+            } else {
+                debug_publish(la, na);   // FSR drew its Debug view on its own
+            }
+        }
         goto upscaled;   // the copy of the result and what follows are the same as DLSS's
     }
     if (!e->feat) {
