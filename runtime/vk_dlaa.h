@@ -15,8 +15,8 @@ void vk_dlaa_init(void);
 // 1 when dlaa is on and NGX came up with DLSS (after vk_dlaa_init): a DLSS mode's smaller scene is scaled up by DLSS.
 int vk_dlaa_available(void);
 const char *vk_dlaa_name(void);   // "FSR 4.1.2" or "DLSS" once DLAA ran, NULL otherwise (the performance overlay)
-// 1 while AMD FSR is the upscaler at work: dlaa is on, dlaa_backend = fsr and FSR came up (after vk_dlaa_init). The
-// game's dynamic resolution (resolution.c res_dynres_live) and its FXAA (vk_dlaa_skip_draw) are off then.
+// 1 while AMD FSR is the upscaler at work: dlaa is on, dlaa_backend = fsr or fsr3 and FSR came up (after vk_dlaa_init).
+// The game's dynamic resolution (resolution.c res_dynres_live) and its FXAA (vk_dlaa_skip_draw) are off then.
 int vk_dlaa_fsr_on(void);
 // vk_exec.c vk_exec_pass_begin, once the pass's targets are resolved and before its barrier: arms the frame on the
 // scene's light target or, at the first quarter-width pass after it, runs DLAA on that target. Each present ends the
@@ -51,6 +51,9 @@ int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]);
 // with vk_alphaobj_execute into an R8 image cleared to 1, which dlaa_mv.comp turns into the mask. Returns the draws.
 int vk_dlaa_reactive_alpha(const VkExec *ex);
 int vk_alphaobj_execute(VkExec *ex, VkImageView target, VkImageView depth, VkFormat depth_fmt, uint32_t w, uint32_t h);
+// nvn_api_core.c ov_memcpy, after a 64-byte copy on the game's thread: the camera jitter of 1.4.3 (vk_dlaa.c).
+void vk_dlaa_camera_copied(uint64_t lr, uint64_t dst, uint64_t off);
+void vk_dlaa_game_present(void);   // vk_backend.c, each of the game's presents, on its thread
 // vk_mvcheck.c (TOTK_MV_CHECK, test): mv_pass hands it the motion image after the camera pass and, after the object
 // pass, the motion image again and the scene light target it ran on; it measures how well the vectors fit the picture.
 void vk_mvcheck_camera(VkCommandBuffer cb, VkImage mv, uint32_t w, uint32_t h, float jx, float jy);

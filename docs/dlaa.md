@@ -12,7 +12,7 @@ render resolution.
 
 | File | Role |
 | --- | --- |
-| `runtime/vk_dlaa.c` | The DLAA/upscaling stage shared by DLSS and FSR: finds the scene's images, jitters the scene, runs `evaluate`, picks the Mipmap bias (`dlss_mode`). |
+| `runtime/vk_dlaa.c` | The DLAA/upscaling stage shared by DLSS and FSR: finds the scene's images, applies scene jitter, runs `evaluate`, and selects the Mipmap bias (`dlss_mode`). |
 | `runtime/vk_ffx.c`, `vk_ffx.h` | The FSR backend (Windows only): loads the AMD DLLs, creates the context, dispatches. |
 | `runtime/ffx_api_min.h` | Hand-copied descriptor layouts and constants of the FSR SDK 2.4.0 ffx-api (no SDK code is compiled in). |
 | `runtime/resolution.c` | Output and nominal scene sizes (`res_sizes`), and the Mipmap bias formulas (`res_dlss_lod_bias`, `res_fsr_lod_bias`). |
@@ -21,17 +21,18 @@ render resolution.
 
 ## Selecting FSR
 
-`dlaa = 1` turns the stage on; `dlaa_backend = fsr` selects FSR instead of DLSS/NGX (`vk_ffx_wanted`). On a non-Windows
-build FSR is absent. `vk_ffx_device_exts` adds the extensions at device creation, `vk_ffx_init` runs once the device
-exists.
+`dlaa = 1` turns the stage on. `dlaa_backend = fsr` selects the newest FSR 4 version offered for the GPU, falling back
+to the DLL's default (FSR 3.1); `dlaa_backend = fsr3` selects the newest FSR 3 version offered. Both use `vk_ffx_wanted`;
+FSR is available only on Windows. `vk_ffx_device_exts` adds available FSR extensions at device creation, and
+`vk_ffx_init` runs once the device exists.
 
 ## The AMD DLLs and the version
 
 `amd_fidelityfx_loader_vk.dll` exports the five ffx-api entry points (`ffxCreateContext`, `ffxDestroyContext`,
 `ffxConfigure`, `ffxQuery`, `ffxDispatch`) and finds `amd_fidelityfx_upscaler_vk.dll` next to itself; both are loaded
-from the executable's folder. The upscaler DLL lists several versions (FSR 4.x and FSR 3.1.x, and the log also shows
-2.3.4). `vk_ffx_init` pins the newest 4.x if the device runs it, otherwise leaves the DLL's default, which is FSR 3.1.6
-on GPUs without FSR 4. Every context is created with that version (`ffxOverrideVersion`). The DLL is signed and its source
+from the executable's folder. The upscaler DLL lists several versions. `vk_ffx_init` pins the newest FSR 4 version for
+`fsr`, or newest FSR 3 version for `fsr3`, when offered for the GPU; otherwise it leaves the DLL's default. Every context
+is created with the selected version (`ffxOverrideVersion`). The DLL is signed and its source
 is not in this project: what happens inside is known only from the SDK's public headers, shaders and guide.
 
 ## What FSR is given (`evaluate` in `vk_dlaa.c`)
@@ -40,14 +41,15 @@ is not in this project: what happens inside is known only from the SDK's public 
 - **Depth**: the D32F scene depth. Inverted or infinite depth is stated at context creation.
 - **Motion vectors**: at the render resolution, in render pixels, from this frame's position to last frame's, without the
   jitter (`motionVectorScale` 1).
-- **Jitter**: the jitter the scene was drawn with. The scene's draws are moved by it in `vk_dlaa_viewport` (the viewport is
-  shifted by the frame's jitter when it is recorded); `next_jitter(w, ow)` gives the phase from the render and presentation
-  widths. `fsr_jitter_sign = -1` flips the sign for testing.
+- **Jitter**: the jitter applied to the scene and passed to FSR. Normally `vk_dlaa_viewport` shifts scene draw viewports;
+  on game version 1.4.3, `dlaa_cam_jitter` can instead apply it in the camera block. `next_jitter(w, ow)` selects the
+  phase from render and presentation widths. `fsr_jitter_sign = -1` flips the sign sent to FSR for testing.
 - **Context flags**: `FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | AUTO_EXPOSURE | DYNAMIC_RESOLUTION`, plus `DEPTH_INVERTED` and
   `DEPTH_INFINITE` as the scene needs, and `DEBUG_CHECKING` with `fsr_debug = 1`. No debug visualization or non-linear
   colour flag is set yet.
-- **One context per run**: created with the dynamic-resolution flag and the largest expected render resolution; each
-  dispatch states its own `renderSize`.
+- **Context lifetime**: created with the dynamic-resolution flag and a maximum render size; each dispatch states its own
+  `renderSize`. It is reused while it fits and recreated when output size, depth convention, or context requirements
+  change. Recreating it resets FSR history.
 - Optional inputs are asked of the upscaler once per context (`vk_ffx_uses_reactive`, `vk_ffx_uses_transparency`). For
   FSR 3.1, `ffxConfigure` hands it the constants the `fsr_*` settings name.
 
@@ -60,7 +62,7 @@ no real source is left out and the log says so.
 | --- | --- | --- |
 | Colour, depth, jitter, reset, render and presentation size, camera near/far/fov, frame time | used | As above. |
 | Motion vectors | used | The camera's reprojection from depth (`dlaa_mv.comp`) with the per-object draws (`dlaa_objmv`, `vk_exec_draw.c`) written over it. |
-| Sharpness | used | `sharpness` from the `sharpness` setting; `enableSharpening` when it is above 0. |
+| Sharpness | used | `fsr_sharpness`, passed as `sharpness`; DLSS/game `sharpness` is separate. |
 | Reactive mask | used | An R8 image at scene resolution, `e->mask`. It is passed to FSR when the context accepts the resource and `mv_pass` wrote it. Contents are below. |
 | Transparency and composition mask | **not supplied** | No source or image is implemented; `fd.transparency` remains empty. |
 | Exposure | not supplied | `AUTO_EXPOSURE` is set on the context. |
