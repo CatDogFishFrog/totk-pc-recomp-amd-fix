@@ -10,6 +10,11 @@
 //   Alpha replay: the alpha-blended draws into the light target are recorded a second time into an R8 image that keeps
 //     what stays see-through (vk_exec_draw.c alpha_draw); the shader turns it into coverage. The two blend kinds that
 //     qualify are two sources, and each can feed Reactive, T&C or both.
+//   Draw types of the replay: the replay by itself takes only the draws it can repeat exactly (indexed with 16 or 32 bit
+//     indices, and without indices). Line loops, draws with byte indices and indirect draws are three more sources, one
+//     per type and per mask, each switched on to test that one type. A type source adds no coverage of its own: it lets
+//     the draws of its type that the blend kinds above qualify go into the mask it names (a draw goes into the masks
+//     both its blend kind and its type name), so it does nothing while no alpha source feeds that mask.
 // Which pixels a source marks is a hypothesis to test in the Debug view of the Video tab, not a known property of the
 // game's materials: docs/dlaa.md, "What goes into each mask".
 #pragma once
@@ -20,7 +25,7 @@ extern "C" {
 #endif
 
 typedef enum { FSRM_REACTIVE, FSRM_TC, FSRM_TARGETS } FsrMaskTarget;
-typedef enum { FSRM_GBUFFER_CLASS, FSRM_ALPHA_REPLAY } FsrMaskMethod;
+typedef enum { FSRM_GBUFFER_CLASS, FSRM_ALPHA_REPLAY, FSRM_DRAW_TYPE } FsrMaskMethod;
 
 // G-buffer classes. The first three are the characters (they share the Character trails strength and the previous-frame
 // footprint, dlaa_mv.comp); the order is the shader's, which treats classes 0..2 as characters.
@@ -31,6 +36,13 @@ typedef enum { FSRM_CLASS_LINK, FSRM_CLASS_CREATURE, FSRM_CLASS_HELD, FSRM_CLASS
 // and premultiplied blend), and source factor SRC_ALPHA with destination ONE (additive scaled by alpha).
 typedef enum { FSRM_ALPHA_BLEND, FSRM_ALPHA_ADD, FSRM_ALPHA_CLASSES } FsrMaskAlpha;
 
+// The draw types the replay takes only on request (vk_exec_draw.c, the draw ops): a line loop (drawn as a strip with the
+// first vertex repeated), a draw with byte indices (widened to 16 bits for Vulkan) and DrawElementsIndirect (the
+// arguments are read by the GPU from the game's buffer, again at the replay). The other draws the replay takes need no
+// source of this kind: FSRM_DRAW_ORDINARY, taken by their blend kind alone.
+typedef enum { FSRM_DRAW_LINE_LOOP, FSRM_DRAW_BYTE_INDEX, FSRM_DRAW_INDIRECT, FSRM_DRAW_TYPES } FsrMaskDraw;
+#define FSRM_DRAW_ORDINARY (-1)
+
 // Bits of a destination set (alpha replay: which mask images a draw is recorded into; plan: which masks are written).
 #define FSRM_DEST_REACTIVE 1u
 #define FSRM_DEST_TC 2u
@@ -39,7 +51,7 @@ typedef struct {
     const char *key;           // the on/off setting, with its TOTK_ prefix
     FsrMaskTarget target;
     FsrMaskMethod method;
-    int what;                  // FsrMaskClass or FsrMaskAlpha, by method
+    int what;                  // FsrMaskClass, FsrMaskAlpha or FsrMaskDraw, by method
     UiTextId label, desc;      // the menu row
     const char *level_key;     // the setting for the strength in percent (a second row under it), NULL: none
     UiTextId level_label, level_desc;
@@ -72,6 +84,11 @@ void fsrmask_plan(FsrMaskPlan *p, int fsr, float char_level, int take_reactive, 
 // the draw is not recorded). Any thread: the replay asks this per blend draw, so it reads a cache that follows
 // cfg_version. Does not know which masks the FSR context takes (vk_dlaa.c vk_dlaa_alpha_dests masks that).
 unsigned fsrmask_alpha_dests(int blend_class);
+
+// The destinations the type sources of one draw type (FsrMaskDraw) name, from the settings (FSRM_DEST_* bits). The replay
+// intersects it with fsrmask_alpha_dests of the draw's blend kind: a draw of this type is recorded into the masks both
+// name. Same cache and thread rules as fsrmask_alpha_dests; 0 for a type out of range.
+unsigned fsrmask_draw_dests(int draw_type);
 
 // For the menu's rows (implemented in vk_dlaa.c): 1 when an FSR context exists, and then whether it takes the Reactive and
 // the T&C input. 0, outputs untouched, before the first context.

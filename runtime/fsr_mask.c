@@ -29,6 +29,7 @@ static const float TOP[FSRM_TARGETS] = {0.9f, 1.0f};
 #define T FSRM_TC
 #define G FSRM_GBUFFER_CLASS
 #define A FSRM_ALPHA_REPLAY
+#define D FSRM_DRAW_TYPE
 // The table. The order is the order of the rows in the menu: each target's sources together. Every key has a row in
 // cfg.c (known, groups, metas) and in totk.ini.example; the level keys are percent.
 static const FsrMaskSource SRC[] = {
@@ -39,15 +40,22 @@ static const FsrMaskSource SRC[] = {
      "TOTK_FSR_MASK_R_FOLIAGE_LEVEL", UI_MENU_FSRM_LEVEL, UI_MENU_FSRM_R_FOLIAGE_LEVEL_DESC},
     {"TOTK_FSR_MASK_R_ALPHA_BLEND", R, A, FSRM_ALPHA_BLEND, UI_MENU_FSRM_L_ALPHA_BLEND, UI_MENU_FSRM_R_ALPHA_BLEND_DESC, NULL, 0, 0},
     {"TOTK_FSR_MASK_R_ALPHA_ADD", R, A, FSRM_ALPHA_ADD, UI_MENU_FSRM_L_ALPHA_ADD, UI_MENU_FSRM_R_ALPHA_ADD_DESC, NULL, 0, 0},
+    {"TOTK_FSR_MASK_R_DRAW_LINE_LOOP", R, D, FSRM_DRAW_LINE_LOOP, UI_MENU_FSRM_L_DRAW_LINE_LOOP, UI_MENU_FSRM_R_DRAW_LINE_LOOP_DESC, NULL, 0, 0},
+    {"TOTK_FSR_MASK_R_DRAW_BYTE_INDEX", R, D, FSRM_DRAW_BYTE_INDEX, UI_MENU_FSRM_L_DRAW_BYTE_INDEX, UI_MENU_FSRM_R_DRAW_BYTE_INDEX_DESC, NULL, 0, 0},
+    {"TOTK_FSR_MASK_R_DRAW_INDIRECT", R, D, FSRM_DRAW_INDIRECT, UI_MENU_FSRM_L_DRAW_INDIRECT, UI_MENU_FSRM_R_DRAW_INDIRECT_DESC, NULL, 0, 0},
     {"TOTK_FSR_MASK_TC_FOLIAGE", T, G, FSRM_CLASS_FOLIAGE, UI_MENU_FSRM_L_FOLIAGE, UI_MENU_FSRM_TC_FOLIAGE_DESC,
      "TOTK_FSR_MASK_TC_FOLIAGE_LEVEL", UI_MENU_FSRM_LEVEL, UI_MENU_FSRM_TC_FOLIAGE_LEVEL_DESC},
     {"TOTK_FSR_MASK_TC_ALPHA_BLEND", T, A, FSRM_ALPHA_BLEND, UI_MENU_FSRM_L_ALPHA_BLEND, UI_MENU_FSRM_TC_ALPHA_BLEND_DESC, NULL, 0, 0},
     {"TOTK_FSR_MASK_TC_ALPHA_ADD", T, A, FSRM_ALPHA_ADD, UI_MENU_FSRM_L_ALPHA_ADD, UI_MENU_FSRM_TC_ALPHA_ADD_DESC, NULL, 0, 0},
+    {"TOTK_FSR_MASK_TC_DRAW_LINE_LOOP", T, D, FSRM_DRAW_LINE_LOOP, UI_MENU_FSRM_L_DRAW_LINE_LOOP, UI_MENU_FSRM_TC_DRAW_LINE_LOOP_DESC, NULL, 0, 0},
+    {"TOTK_FSR_MASK_TC_DRAW_BYTE_INDEX", T, D, FSRM_DRAW_BYTE_INDEX, UI_MENU_FSRM_L_DRAW_BYTE_INDEX, UI_MENU_FSRM_TC_DRAW_BYTE_INDEX_DESC, NULL, 0, 0},
+    {"TOTK_FSR_MASK_TC_DRAW_INDIRECT", T, D, FSRM_DRAW_INDIRECT, UI_MENU_FSRM_L_DRAW_INDIRECT, UI_MENU_FSRM_TC_DRAW_INDIRECT_DESC, NULL, 0, 0},
 };
 #undef R
 #undef T
 #undef G
 #undef A
+#undef D
 #define NSRC ((int)(sizeof SRC / sizeof SRC[0]))
 
 int fsrmask_source_count(void) { return NSRC; }
@@ -99,30 +107,44 @@ void fsrmask_plan(FsrMaskPlan *p, int fsr, float char_level, int take_reactive, 
             if (s->target == FSRM_TC) p->cls[s->what].tc = lvl[i];
             else p->cls[s->what].reactive = lvl[i];
             p->classes_dests |= d;
-        } else if (!legacy_off) {
-            p->alpha_dests |= d;
+        } else if (s->method == FSRM_ALPHA_REPLAY) {
+            if (!legacy_off) p->alpha_dests |= d;
         }
+        // FSRM_DRAW_TYPE: no coverage of its own, so nothing in the plan; the replay asks fsrmask_draw_dests per draw
     }
     for (int i = 0; i < FSRM_CHARACTER_CLASSES; i++)
         if (p->cls[i].reactive > 0) p->footprint = char_level;   // where an enabled character class just was
 }
 
-// The alpha replay's destinations per blend kind, from the settings. The replay asks it for every blend draw on several
-// threads, so it keeps one answer per cfg_version: whoever sees a stale answer works it out again (the same one from
-// the same settings) and publishes it.
-static _Atomic unsigned alpha_dest_cache[FSRM_ALPHA_CLASSES];
-static _Atomic unsigned alpha_dest_seen = ~0u;
+// The replay's destinations per blend kind and per draw type, from the settings. The replay asks for every blend draw on
+// several threads, so it keeps one answer per cfg_version: whoever sees a stale answer works it out again (the same one
+// from the same settings) and publishes it. The cache holds the blend kinds first, then the draw types.
+#define DEST_SLOTS (FSRM_ALPHA_CLASSES + FSRM_DRAW_TYPES)
+static _Atomic unsigned dest_cache[DEST_SLOTS];
+static _Atomic unsigned dest_seen = ~0u;
+
+static unsigned dest_slot(int slot) {
+    unsigned v = cfg_version();
+    if (atomic_load_explicit(&dest_seen, memory_order_acquire) != v) {
+        unsigned d[DEST_SLOTS] = {0};
+        for (int i = 0; i < NSRC; i++) {
+            if (!cfg_bool(SRC[i].key)) continue;
+            if (SRC[i].method == FSRM_ALPHA_REPLAY) {
+                if (!alpha_switched_off()) d[SRC[i].what] |= dest_bit(SRC[i].target);
+            } else if (SRC[i].method == FSRM_DRAW_TYPE) {
+                d[FSRM_ALPHA_CLASSES + SRC[i].what] |= dest_bit(SRC[i].target);
+            }
+        }
+        for (int i = 0; i < DEST_SLOTS; i++) atomic_store_explicit(&dest_cache[i], d[i], memory_order_relaxed);
+        atomic_store_explicit(&dest_seen, v, memory_order_release);
+    }
+    return atomic_load_explicit(&dest_cache[slot], memory_order_relaxed);
+}
 
 unsigned fsrmask_alpha_dests(int blend_class) {
-    if ((unsigned)blend_class >= FSRM_ALPHA_CLASSES) return 0;
-    unsigned v = cfg_version();
-    if (atomic_load_explicit(&alpha_dest_seen, memory_order_acquire) != v) {
-        unsigned d[FSRM_ALPHA_CLASSES] = {0};
-        if (!alpha_switched_off())
-            for (int i = 0; i < NSRC; i++)
-                if (SRC[i].method == FSRM_ALPHA_REPLAY && cfg_bool(SRC[i].key)) d[SRC[i].what] |= dest_bit(SRC[i].target);
-        for (int i = 0; i < FSRM_ALPHA_CLASSES; i++) atomic_store_explicit(&alpha_dest_cache[i], d[i], memory_order_relaxed);
-        atomic_store_explicit(&alpha_dest_seen, v, memory_order_release);
-    }
-    return atomic_load_explicit(&alpha_dest_cache[blend_class], memory_order_relaxed);
+    return (unsigned)blend_class < FSRM_ALPHA_CLASSES ? dest_slot(blend_class) : 0;
+}
+
+unsigned fsrmask_draw_dests(int draw_type) {
+    return (unsigned)draw_type < FSRM_DRAW_TYPES ? dest_slot(FSRM_ALPHA_CLASSES + draw_type) : 0;
 }

@@ -113,8 +113,9 @@ zero outside covered draw pixels and on the sky (scene depth at the far plane).
 A draw qualifies only when it belongs to the armed light/depth targets, target 0 has blend enabled, and the RGB blend
 uses either `ONE_MINUS_SRC_ALPHA` for destination alpha coverage or `SRC_ALPHA`/`ONE` for alpha-scaled ADD coverage.
 It must also have a usable, non-multisample pipeline, enabled depth test, disabled depth writes, and no feedback or
-storage resources. Plain additive blends, indirect and byte-index draws, line loops, and unbuilt pipelines are omitted.
-The log line `vk_exec: reactive mask draws` reports omitted draws by cause.
+storage resources. Plain additive blends and unbuilt pipelines are omitted, and so are indirect draws, draws with byte
+indices and line loops unless a draw-type source takes them (Method 3). The log line `vk_exec: reactive mask draws`
+reports omitted draws by cause.
 
 The two blend kinds are separate sources, and each can feed Reactive, T&C or both:
 
@@ -127,15 +128,48 @@ A draw is recorded once and drawn into the image of each mask it feeds; a blend 
 recorded at all, which saves the second pass. The replay does not know what a draw is: smoke, glass and water that pass
 the criteria above are taken alike, and the replay can widen the coverage where the original draw relied on stencil. The
 T&C alpha sources write the same coverage as the Reactive ones into the T&C image; they are experimental and off. The
-old `fsr_alpha = 0` still turns every alpha source off.
+old `fsr_alpha = 0` still turns every alpha source off, and with them the draw-type sources of Method 3, which only
+widen the alpha sources.
 
 No source for a mask means `e->mask` (or `e->tc`) is not written and FSR receives no resource for that input. The log line
 `fsr: masks given` says, whenever it changes, which masks were given and which the context takes.
 
+### Method 3: draw types of the replay
+
+Three kinds of draw call were not repeated by the replay, because the host turns them into something else before Vulkan
+sees them or reads their arguments from the GPU. Each is now a source of its own, for each mask, off by default, so that
+every type can be tested alone:
+
+| Draw type | Reactive | T&C | How the replay repeats it |
+| --- | --- | --- | --- |
+| Line loop | `fsr_mask_r_draw_line_loop` | `fsr_mask_tc_draw_line_loop` | `op_draw` draws it as a strip of `n + 1` indices with the first vertex again; the replay reuses those generated indices. |
+| Byte indices | `fsr_mask_r_draw_byte_index` | `fsr_mask_tc_draw_byte_index` | `op_draw_idx` widens them to 16 bits in a scratch buffer; the replay binds that copy (index type 16 bit, as the original draw does). |
+| Indirect (`DrawElementsIndirect`) | `fsr_mask_r_draw_indirect` | `fsr_mask_tc_draw_indirect` | The replay issues the same `vkCmdDrawIndexedIndirect` on the game's argument buffer, with the game's index buffer. |
+
+A draw-type source adds no coverage of its own. The draw still has to qualify as in Method 2 (blend kind, depth test, no
+feedback, no storage resources, a built pipeline), and it goes into the masks that both its blend kind and its type name:
+a byte-index draw of an alpha-blended kind goes into the Reactive mask when `fsr_mask_r_alpha_blend` and
+`fsr_mask_r_draw_byte_index` are on, and into the T&C mask when `fsr_mask_tc_alpha_blend` and `fsr_mask_tc_draw_byte_index`
+are. With no alpha source feeding a mask its type sources do nothing. Cost: the draws of an enabled type are recorded
+and drawn a second time, as in Method 2.
+
+The log line `vk_exec: reactive mask draws` ends with the draws of each type seen and recorded, so a type that never
+shows a recorded draw in a scene can be told apart from one whose draws do not qualify (the causes are in the same
+line). The counts do not say what a draw is.
+
+Not established: that any of the three types holds a category of effect (smoke, sparks, glass) in this game; the counts
+and the Debug view of the Reactive and T&C inputs are how to find out, one type at a time. Limits: the argument buffer of
+an indirect draw is read by the GPU at the replay, at the end of the scene; if the game rewrites it later in the same
+frame, the replay draws with the later arguments. Pipelines with writable storage, images or texel buffers are still not
+replayed (the shader would run again with its side effects), for every type. Byte indices in device-local memory are not
+drawn by the host at all, so they are not replayed either. This is not a classification: a line loop or an indirect draw
+that qualifies is taken whatever it draws.
+
 ### Not implemented
 
-Sources that need a draw allowlist, additive-specific replay, replay of more draw types, temporal-residual detection or
-reflection data flow are not implemented. No source detects animated textures or reflections.
+Sources that need a draw allowlist, additive-specific replay (plain additive blends without an alpha factor),
+temporal-residual detection or reflection data flow are not implemented. Of the draw types, only the three of Method 3
+are replayed. No source detects animated textures or reflections.
 
 ## Rule: no stand-ins
 

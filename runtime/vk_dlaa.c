@@ -1014,6 +1014,9 @@ int vk_dlaa_reactive_alpha(const VkExec *ex) {
 // The masks (FSRM_DEST_* bits) a draw of this blend kind goes into: the sources that are on, for the masks the context takes.
 unsigned vk_dlaa_alpha_dests(int blend_class) { return fsrmask_alpha_dests(blend_class) & masks_wanted(); }
 
+// The masks the type sources of a draw type name (fsr_mask.h FSRM_DRAW_*), for the masks the context takes.
+unsigned vk_dlaa_draw_dests(int draw_type) { return fsrmask_draw_dests(draw_type) & masks_wanted(); }
+
 // The viewport and scissor of the scene's draws against the render area and the depth target they draw into, logged once
 // for each distinct combination (eight at most). The render resolution the upscaler gets is the size of the light target
 // (evaluate), so a viewport or a scissor smaller than the target would leave edge pixels that it reads undrawn.

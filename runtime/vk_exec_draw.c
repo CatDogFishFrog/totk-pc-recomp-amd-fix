@@ -3508,6 +3508,9 @@ typedef struct {
     uint32_t first;              // first vertex of a draw without indices
     uint8_t kind, indexed;       // MO_MOTION or MO_ALPHA; 0: vkCmdDraw
     uint8_t dests;               // MO_ALPHA: the masks it goes into (FSRM_DEST_* bits)
+    uint8_t indirect;            // MO_ALPHA: drawn with vkCmdDrawIndexedIndirect (indexed is 1 too), arguments at ind/ind_off
+    VkBuffer ind;
+    VkDeviceSize ind_off;
 } MoDraw;
 enum { MO_MOTION, MO_ALPHA };   // MO_ALPHA: the mask images' alpha draws (alpha_draw_), recorded by vk_alphaobj_execute
 typedef struct { VkBuffer b[17]; VkDeviceSize o[17], sz[17], str[17]; } MoVb;
@@ -3769,7 +3772,10 @@ static void mo_emit_range(VkCommandBuffer cb, const MoDraw *list, int count) {
         if (q->indexed) {
             if (!p || !p->indexed || q->ib != p->ib || q->ib_off != p->ib_off || q->it != p->it)
                 vkCmdBindIndexBuffer(cb, q->ib, q->ib_off, q->it);
-            vkCmdDrawIndexed(cb, q->count, q->instances, 0, q->base_vertex, q->base_instance);
+            if (q->indirect)   // the game's own arguments, read by the GPU now (the replay's list: alpha_draw_)
+                vkCmdDrawIndexedIndirect(cb, q->ind, q->ind_off, 1, sizeof(VkDrawIndexedIndirectCommand));
+            else
+                vkCmdDrawIndexed(cb, q->count, q->instances, 0, q->base_vertex, q->base_instance);
         } else {
             vkCmdDraw(cb, q->count, q->instances, q->first, q->base_instance);
         }
@@ -4093,7 +4099,7 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     // into the frame's list, past the primary's binding caches (mo_desc); mo_emit records it
     MQ.d = mo_grow(MQ.d, &MQ.cap, MQ.n + 1, sizeof *MQ.d);
     MoDraw *q = &MQ.d[MQ.n];
-    q->kind = MO_MOTION, q->indexed = 1, q->first = 0;
+    q->kind = MO_MOTION, q->indexed = 1, q->first = 0, q->indirect = 0;
     float par_in[4] = {(float)z->width, (float)z->height, jit[0], jit[1]};
     if (!MQ.par.buffer || memcmp(par_in, MQ.par_in, sizeof par_in)) {
         VkBuffer pbuf;
@@ -4149,16 +4155,42 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
 // light target (vk_dlaa_reactive_alpha), depth tested without depth writes, and its colour blend takes the shader's
 // alpha as the coverage: destination factor ONE_MINUS_SRC_ALPHA (blend and premultiplied blend), or source factor
 // SRC_ALPHA with destination ONE (additive scaled by alpha), equation ADD. Anything else is counted, by cause, in the log
-// line of vk_alphaobj_execute and is not in the mask: blends without an alpha factor (plain additive), line
-// loops, byte indices, indirect draws, and draws whose pipeline was still being built. Quads are taken (their generated
-// indices are reused). The two blend kinds are separate sources of the masks (fsr_mask.h, FSRM_ALPHA_*), each switched
+// line of vk_alphaobj_execute and is not in the mask: blends without an alpha factor (plain additive), draws whose
+// pipeline was still being built, and the three draw types below unless a source takes them. Quads are taken (their
+// generated indices are reused). The two blend kinds are separate sources of the masks (fsr_mask.h, FSRM_ALPHA_*), each switched
 // on for the Reactive mask, the T&C mask or both: a draw whose kind feeds no mask is counted and not recorded, and one
 // that feeds both is recorded once and drawn into both images (vk_alphaobj_execute). TOTK_FSR_ALPHA=0 still turns every
 // alpha source off (fsr_mask.c).
+//
+// Three kinds of draw are replayed only when a source of their type is on (fsr_mask.h FsrMaskDraw), each switched
+// separately for each mask, so that every type can be tested alone. A type source does not decide the coverage, the draw's
+// blend kind does: the draw goes into the masks that both name (vk_dlaa_alpha_dests, vk_dlaa_draw_dests).
+//   Line loop: op_draw draws it as a strip of n + 1 indices (the first vertex again); the replay reuses those indices.
+//   Byte indices: op_draw_idx widens them to 16 bits in a scratch buffer, which the replay reuses (the scratch of the
+//     replayed command buffer lives as long as the buffer, as the quads' indices do).
+//   Indirect: the replay issues the same vkCmdDrawIndexedIndirect on the game's argument buffer. The GPU reads the
+//     arguments at the replay, at the end of the scene, so a draw whose arguments the game rewrites later in the same
+//     frame is replayed with the later ones; the draw's own bindings come from the usual descriptor copy (mo_desc), which
+//     refuses storage the draw writes.
+// Each of them replays the shader again, so it must not have side effects: mo_desc already refuses the pipelines with
+// writable storage, images and texel buffers; none of the types lifts that.
+typedef struct {
+    int type;                    // FSRM_DRAW_* of a type taken on request, FSRM_DRAW_ORDINARY for the rest
+    int indexed;                 // vkCmdDrawIndexed (also the indirect one); 0: vkCmdDraw
+    uint32_t count, instances, first, base_instance;
+    int32_t base_vertex;
+    int itype;                   // NVN_INDEX_TYPE_* of ib (byte indices: the widened 16 bit copy, so UNSIGNED_SHORT)
+    VkBuffer ib;
+    VkDeviceSize ib_off;
+    VkBuffer ind;                // FSRM_DRAW_INDIRECT: the buffer and offset the GPU reads the arguments from
+    VkDeviceSize ind_off;
+} AlphaDraw;
+
 static struct {
     uint64_t listed, indexed, plain;                                  // draws recorded in the list
-    uint64_t no_factor, no_test, writes_depth, feedback, quads, indirect, storage, building;   // seen, not listed
-    uint64_t kind_off;                                                // blend kind qualifies but no mask takes it
+    uint64_t no_factor, no_test, writes_depth, feedback, storage, building;   // seen, not listed
+    uint64_t kind_off;                                                // qualifies, but no mask takes this blend kind and type
+    uint64_t type_seen[FSRM_DRAW_TYPES], type_listed[FSRM_DRAW_TYPES];   // draws of a type taken on request: seen, recorded
     uint64_t per_dest[FSRM_TARGETS];                                  // draws listed for each mask
     uint64_t dropped, ran, ran_draws;
 } AL;
@@ -4172,10 +4204,9 @@ static int alpha_blend_class(const blend_st *b) {
     return -1;
 }
 
-// A draw that vk_dlaa_reactive_alpha accepted and the replay has just recorded: listed when it qualifies. count,
-// instances, first (no indices) or base_vertex and the index buffer (indices) are the draw's own.
-static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instances, uint32_t first,
-                        int32_t base_vertex, uint32_t base_instance, int itype, VkBuffer ib, VkDeviceSize ib_off) {
+// A draw that vk_dlaa_reactive_alpha accepted and the replay has just recorded: listed when it qualifies. The counts,
+// first vertex (no indices) or base_vertex and the index buffer (indices) are the draw's own.
+static void alpha_draw_(VkExec *ex, const AlphaDraw *a) {
     VkExecDraw *D = ex->draw;
     const VkPipeState *os = &D->B.st;
     const VkExecTarget *z = &ex->depth;
@@ -4186,7 +4217,8 @@ static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instan
     int bclass = alpha_blend_class(&os->blend[0]);
     if (bclass < 0) { AL.no_factor++; return; }
     unsigned dests = vk_dlaa_alpha_dests(bclass);
-    if (!dests) { AL.kind_off++; return; }   // no mask takes this blend kind (the menu's FSR mask sources)
+    if (a->type != FSRM_DRAW_ORDINARY) dests &= vk_dlaa_draw_dests(a->type);   // a type is taken where its source says so
+    if (!dests) { AL.kind_off++; return; }   // no mask takes this blend kind (and type): the menu's FSR mask sources
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != z->format) mo_begin(ex, frame);
     VkPipeState ms = *os;
@@ -4224,7 +4256,8 @@ static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instan
     memset(mo_ovr, 0, sizeof mo_ovr);
     mo_ovr_on = 0;   // the draw's own descriptors
     if (!mo_desc(ex, info, q)) { AL.storage++; return; }
-    q->kind = MO_ALPHA, q->indexed = (uint8_t)indexed, q->first = first, q->cam = 0, q->dests = (uint8_t)dests;
+    q->kind = MO_ALPHA, q->indexed = (uint8_t)a->indexed, q->first = a->first, q->cam = 0, q->dests = (uint8_t)dests;
+    q->indirect = a->type == FSRM_DRAW_INDIRECT, q->ind = a->ind, q->ind_off = a->ind_off;
     q->pipe = pipe, q->info = info;
     if (!MQ.nst || memcmp(&MQ.st[MQ.nst - 1], &ms, sizeof ms)) {
         MQ.st = mo_grow(MQ.st, &MQ.cst, MQ.nst + 1, sizeof *MQ.st);
@@ -4234,24 +4267,27 @@ static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instan
     q->v = draw_viewport(ex), q->sc = vk_exec_scissor(ex);
     q->bias[0] = ex->poly_offset.units, q->bias[1] = ex->poly_offset.clamp, q->bias[2] = ex->poly_offset.factor;
     q->vb = mo_vertex_buffers(ex);
-    q->ib = ib, q->ib_off = ib_off;
-    q->it = itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-    q->count = count, q->instances = instances, q->base_vertex = base_vertex, q->base_instance = base_instance;
+    q->ib = a->ib, q->ib_off = a->ib_off;
+    q->it = a->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+    q->count = a->count, q->instances = a->instances, q->base_vertex = a->base_vertex, q->base_instance = a->base_instance;
     MQ.n++;
-    AL.listed++, indexed ? AL.indexed++ : AL.plain++;
+    AL.listed++, a->indexed ? AL.indexed++ : AL.plain++;
+    if (a->type != FSRM_DRAW_ORDINARY) AL.type_listed[a->type]++;
     for (int t = 0; t < FSRM_TARGETS; t++) AL.per_dest[t] += (dests >> t) & 1u;
 }
 
 // Called for every draw into a blend-enabled target 0 (the caller has checked that cheaply); what is not for the mask
-// returns at once. kind: 0 indexed draw (quads too), 1 draw without indices, 2 line loop or byte indices, 3 indirect.
-static void alpha_draw(VkExec *ex, int kind, uint32_t count, uint32_t instances, uint32_t first, int32_t base_vertex,
-                       uint32_t base_instance, int itype, VkBuffer ib, VkDeviceSize ib_off) {
+// returns at once. A draw of a type taken on request (a->type) is only looked at when a source of that type is on.
+static void alpha_draw(VkExec *ex, const AlphaDraw *a) {
     VkExecDraw *D = ex->draw;
     if (MO.failed || !D->B.st_valid || !vk_dlaa_reactive_alpha(ex)) return;
     if (ex->chunked) plat_mutex_lock(&mo_lock);
-    if (kind == 2) AL.quads++;
-    else if (kind == 3) AL.indirect++;
-    else alpha_draw_(ex, kind == 0, count, instances, first, base_vertex, base_instance, itype, ib, ib_off);
+    if (a->type == FSRM_DRAW_ORDINARY) {
+        alpha_draw_(ex, a);
+    } else {
+        AL.type_seen[a->type]++;
+        if (vk_dlaa_draw_dests(a->type)) alpha_draw_(ex, a);
+    }
     if (ex->chunked) plat_mutex_unlock(&mo_lock);
 }
 
@@ -4264,15 +4300,19 @@ unsigned vk_alphaobj_execute(VkExec *ex, const VkImageView target[FSRM_TARGETS],
     if (++frames % 600 == 0)
         rt_log("vk_exec: reactive mask draws, in %llu frames: %llu recorded (%llu indexed, %llu without indices); not in the "
                "mask: %llu blends without an alpha factor, %llu without depth test, %llu writing depth, %llu feedback, "
-               "%llu line loops or byte indices, %llu indirect, %llu with storage resources, %llu waiting for a pipeline, %llu of a "
-               "blend kind no mask takes; %llu lists dropped; %llu passes, %.1f draws a pass; recorded for the reactive mask "
-               "%llu, for the T&C mask %llu", (unsigned long long)frames, (unsigned long long)AL.listed,
+               "%llu with storage resources, %llu waiting for a pipeline, %llu of a blend kind or draw type no mask takes; "
+               "%llu lists dropped; %llu passes, %.1f draws a pass; recorded for the reactive mask %llu, for the T&C mask "
+               "%llu; draw types taken on request, seen/recorded: line loops %llu/%llu, byte indices %llu/%llu, indirect "
+               "%llu/%llu", (unsigned long long)frames, (unsigned long long)AL.listed,
                (unsigned long long)AL.indexed, (unsigned long long)AL.plain, (unsigned long long)AL.no_factor,
                (unsigned long long)AL.no_test, (unsigned long long)AL.writes_depth, (unsigned long long)AL.feedback,
-               (unsigned long long)AL.quads, (unsigned long long)AL.indirect, (unsigned long long)AL.storage,
-               (unsigned long long)AL.building, (unsigned long long)AL.kind_off, (unsigned long long)AL.dropped,
-               (unsigned long long)AL.ran, AL.ran ? (double)AL.ran_draws / (double)AL.ran : 0.0,
-               (unsigned long long)AL.per_dest[FSRM_REACTIVE], (unsigned long long)AL.per_dest[FSRM_TC]);
+               (unsigned long long)AL.storage, (unsigned long long)AL.building, (unsigned long long)AL.kind_off,
+               (unsigned long long)AL.dropped, (unsigned long long)AL.ran,
+               AL.ran ? (double)AL.ran_draws / (double)AL.ran : 0.0, (unsigned long long)AL.per_dest[FSRM_REACTIVE],
+               (unsigned long long)AL.per_dest[FSRM_TC], (unsigned long long)AL.type_seen[FSRM_DRAW_LINE_LOOP],
+               (unsigned long long)AL.type_listed[FSRM_DRAW_LINE_LOOP], (unsigned long long)AL.type_seen[FSRM_DRAW_BYTE_INDEX],
+               (unsigned long long)AL.type_listed[FSRM_DRAW_BYTE_INDEX], (unsigned long long)AL.type_seen[FSRM_DRAW_INDIRECT],
+               (unsigned long long)AL.type_listed[FSRM_DRAW_INDIRECT]);
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (!MQ.n || MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != depth_fmt) return 0;
     static MoDraw *ab;
@@ -4437,6 +4477,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
     ex->fr.draws++;
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
+    VkDescriptorBufferInfo loop_ib = {0};   // the line loop's generated indices (the replay of a line loop reuses them)
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
         uint32_t *ix = malloc(sizeof *ix * 6 * q);
@@ -4449,7 +4490,9 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         free(ix);
         vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, 0, (uint32_t)d->base_instance);
         if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw): the quads' own generated indices
-            alpha_draw(ex, 0, 6 * q, inst, 0, 0, (uint32_t)d->base_instance, NVN_INDEX_TYPE_UNSIGNED_INT, qb.buffer, qb.offset);
+            alpha_draw(ex, &(AlphaDraw){.type = FSRM_DRAW_ORDINARY, .indexed = 1, .count = 6 * q, .instances = inst,
+                                        .base_instance = (uint32_t)d->base_instance,
+                                        .itype = NVN_INDEX_TYPE_UNSIGNED_INT, .ib = qb.buffer, .ib_off = qb.offset});
         ex->recorded++;
         return;
     } else if (d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && n >= 2) {   // a strip that returns to its first vertex
@@ -4457,17 +4500,21 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         if (!ix) rt_fatal("vk: out of memory");
         for (uint32_t i = 0; i < n; i++) ix[i] = first + i;
         ix[n] = first;
-        bind_index(ex, ix, sizeof *ix * (n + 1), VK_INDEX_TYPE_UINT32);
+        loop_ib = bind_index(ex, ix, sizeof *ix * (n + 1), VK_INDEX_TYPE_UINT32);
         free(ix);
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
         if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw)
-            alpha_draw(ex, 1, n, inst, first, 0, (uint32_t)d->base_instance, 0, VK_NULL_HANDLE, 0);
+            alpha_draw(ex, &(AlphaDraw){.type = FSRM_DRAW_ORDINARY, .count = n, .instances = inst, .first = first,
+                                        .base_instance = (uint32_t)d->base_instance});
         ex->recorded++;
         return;
     }
-    if (D->B.st.color.blend_en & 1) alpha_draw(ex, 2, n, inst, first, 0, 0, 0, VK_NULL_HANDLE, 0);   // line loops: counted only
+    if (D->B.st.color.blend_en & 1)   // line loops: taken only where a draw-type source says so (alpha_draw)
+        alpha_draw(ex, &(AlphaDraw){.type = FSRM_DRAW_LINE_LOOP, .indexed = 1, .count = n + 1, .instances = inst,
+                                    .base_instance = (uint32_t)d->base_instance, .itype = NVN_INDEX_TYPE_UNSIGNED_INT,
+                                    .ib = loop_ib.buffer, .ib_off = loop_ib.offset});
     ex->recorded++;
 }
 
@@ -4501,6 +4548,10 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
+    // the index buffer the reactive mask's replay binds: the game's, or for byte indices the widened copy
+    VkBuffer replay_ib = sp.buffer;
+    VkDeviceSize replay_ib_off = sp.offset;
+    int replay_itype = d->itype;
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
@@ -4511,7 +4562,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
             uint8_t v = ((const uint8_t *)(uintptr_t)d->ibuf)[i];
             ix[i] = restart && v == 0xff ? 0xffff : v;
         }
-        bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
+        VkDescriptorBufferInfo wide = bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
+        replay_ib = wide.buffer, replay_ib_off = wide.offset, replay_itype = NVN_INDEX_TYPE_UNSIGNED_SHORT;
         free(ix);
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
@@ -4526,10 +4578,12 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
                      (uint32_t)d->base_instance);
     ex->recorded++;
     if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) mvobj_draw(ex, d, sp.buffer, sp.offset);
-    if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw)
-        alpha_draw(ex, d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE ? 2 : 0, (uint32_t)d->count,
-                   d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex, (uint32_t)d->base_instance, d->itype,
-                   sp.buffer, sp.offset);
+    if (D->B.st.color.blend_en & 1)   // the reactive mask's alpha draws (alpha_draw); byte indices only where a source says so
+        alpha_draw(ex, &(AlphaDraw){.type = d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE ? FSRM_DRAW_BYTE_INDEX : FSRM_DRAW_ORDINARY,
+                                    .indexed = 1, .count = (uint32_t)d->count,
+                                    .instances = d->instances > 0 ? (uint32_t)d->instances : 1,
+                                    .base_vertex = d->base_vertex, .base_instance = (uint32_t)d->base_instance,
+                                    .itype = replay_itype, .ib = replay_ib, .ib_off = replay_ib_off});
 }
 
 // DrawElementsIndirect: the arguments are read by the GPU from the pool buffer (they are often written by an earlier
@@ -4551,7 +4605,9 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
-    if (D->B.st.color.blend_en & 1) alpha_draw(ex, 3, 0, 0, 0, 0, 0, 0, VK_NULL_HANDLE, 0);   // counted only
+    if (D->B.st.color.blend_en & 1)   // indirect draws: taken only where a draw-type source says so (alpha_draw)
+        alpha_draw(ex, &(AlphaDraw){.type = FSRM_DRAW_INDIRECT, .indexed = 1, .itype = d->itype, .ib = ib.buffer,
+                                    .ib_off = ib.offset, .ind = ip.buffer, .ind_off = ip.offset});
     ex->recorded += 2;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
     VK_MEM_BOUND(ip);

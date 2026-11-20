@@ -53,6 +53,9 @@ int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]);
 // takes none), which dlaa_mv.comp turns into mask values. Returns the FSRM_DEST_* bits of the images that got draws.
 int vk_dlaa_reactive_alpha(const VkExec *ex);
 unsigned vk_dlaa_alpha_dests(int blend_class);
+// The masks the type sources of a draw type (FSRM_DRAW_*) name, for the masks the FSR context takes. A draw of that type
+// goes into vk_dlaa_alpha_dests(its blend kind) & vk_dlaa_draw_dests(its type).
+unsigned vk_dlaa_draw_dests(int draw_type);
 unsigned vk_alphaobj_execute(VkExec *ex, const VkImageView target[2], VkImageView depth, VkFormat depth_fmt, uint32_t w,
                              uint32_t h);
 // nvn_api_core.c ov_memcpy, after a 64-byte copy on the game's thread: the camera jitter of 1.4.3 (vk_dlaa.c).
