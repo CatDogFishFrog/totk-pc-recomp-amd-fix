@@ -63,43 +63,79 @@ no real source is left out and the log says so.
 | Colour, depth, jitter, reset, render and presentation size, camera near/far/fov, frame time | used | As above. |
 | Motion vectors | used | The camera's reprojection from depth (`dlaa_mv.comp`) with the per-object draws (`dlaa_objmv`, `vk_exec_draw.c`) written over it. |
 | Sharpness | used | `fsr_sharpness`, passed as `sharpness`; DLSS/game `sharpness` is separate. |
-| Reactive mask | used | An R8 image at scene resolution, `e->mask`. It is passed to FSR when the context accepts the resource and `mv_pass` wrote it. Contents are below. |
-| Transparency and composition mask | **not supplied** | No source or image is implemented; `fd.transparency` remains empty. |
+| Reactive mask | used | An R8 image at scene resolution, `e->mask`. It is passed to FSR when the context accepts the resource and `mv_pass` wrote it from at least one source that is on. Contents are below. |
+| Transparency and composition mask | used, if a source is on | An R8 image at scene resolution, `e->tc`, its own image. It is passed when the context accepts the resource and `mv_pass` wrote it from at least one source that is on; every source is off by default, so by default it is not supplied. Contents are below. |
 | Exposure | not supplied | `AUTO_EXPOSURE` is set on the context. |
 
 ## What goes into each mask
 
-### Reactive mask
+Every way a pixel can enter a mask is a *source*: a row of the table in `runtime/fsr_mask.c`, with a setting of its own
+(`fsr_mask_*`, the "FSR mask sources" rows of the Video tab, listed in [settings.md](settings.md)). The enabled sources of
+a mask combine per pixel by the larger value. `fsrmask_plan` turns the settings into one frame's plan, `mv_pass` in
+`vk_dlaa.c` hands the plan to `dlaa_mv.comp` as push constants, and a mask nobody feeds is not written and not given to
+FSR. DLSS keeps its one bias mask: the three character classes at the Character trails strength, no other source.
 
-`dlaa_mv.comp` builds `e->mask` as an R8 image at scene resolution. At each pixel it takes the larger value from:
+A new source is a table row and a catalog text (`UI_MENU_FSRM_*`); the menu builds its rows from the table. Which pixels
+a source marks is a hypothesis to check in the Debug view of the Video tab (the Reactive and T&C inputs views), not an
+established property of the game's materials.
 
-1. **Qualifying alpha-blended draws.** `alpha_draw` and `vk_alphaobj_execute` replay qualifying draw calls with the game's
-   shaders into an R8 target cleared to 1, depth-tested and with no depth writes. The value is
-   `1 - retained_alpha`, capped at 0.9. It is zero outside covered draw pixels and on the sky (scene depth at the far
-   plane).
+### Method 1: G-buffer class
 
-   A draw qualifies only when it belongs to the armed light/depth targets, target 0 has blend enabled, and the RGB blend
-   uses either `ONE_MINUS_SRC_ALPHA` for destination alpha coverage or `SRC_ALPHA`/`ONE` for alpha-scaled ADD coverage.
-   It must also have a usable, non-multisample pipeline, enabled depth test, disabled depth writes, and no feedback or
-   storage resources. Plain additive blends, indirect and byte-index draws, line loops, and unbuilt pipelines are omitted.
-   `TOTK_FSR_ALPHA=0` disables this source. The log line `vk_exec: reactive mask draws` reports omitted draws by cause.
+Target 0 of the G-buffer carries an object class in green. Measured on single frames: Link 253/255, other characters and
+creatures 125, held items 160, foliage 32, terrain 0. `dlaa_mv.comp` compares the value with each class's band
+(`BANDS` in `fsr_mask.c`):
 
-2. **Characters and their previous-frame footprint.** Target 0 of the G-buffer carries object classes in green. A pixel
-   whose green value is greater than `64/255` is a character, creature, or held item. It gets
-   `TOTK_DLSS_CHAR_MASK` percent, default 65% and capped at 90% for FSR.
+| Source (setting) | Mask | Band | Default |
+| --- | --- | --- | --- |
+| Link (`fsr_mask_r_link`) | Reactive | 207..255 | on |
+| Characters and creatures (`fsr_mask_r_creatures`) | Reactive | 65..142 | on |
+| Held items (`fsr_mask_r_held`) | Reactive | 143..206 | on |
+| Foliage (`fsr_mask_r_foliage`, strength `fsr_mask_r_foliage_level`) | Reactive | 28..36 | off |
+| Foliage (`fsr_mask_tc_foliage`, strength `fsr_mask_tc_foliage_level`) | T&C | 28..36 | off |
 
-   The pass also marks a 3x3 area around the pixel's previous-frame position when that position belonged to a character.
-   This covers the footprint of a character whose motion vector is only the camera's. The two character sources in one
-   frame are already combined into one binary footprint; this footprint and the alpha source are then combined as a
-   per-pixel maximum. `TOTK_DLSS_CHAR_MASK=0` disables the character source.
+The three character bands are contiguous and together equal the single threshold (above 64/255) the characters' mask
+had before, so with all three on nothing changed. Their value is the Character trails strength (`dlss_char_mask`, default
+65%, at most 90% for FSR; 0 turns the three off). The pass also marks a 3x3 area around the pixel's previous-frame
+position when that position belonged to an enabled character class: this covers the footprint of a character whose motion
+vector is only the camera's. Foliage is a narrow comparison round its measured value, not a threshold, so it cannot grow
+into the character bands; it has no footprint. Its strengths are percent, default 25, a starting value nobody measured.
+Reactive and T&C foliage are separate sources on purpose: the first tests unstable reconstruction of moving leaves, the
+second a colour that changes although the motion vector is right.
+Not established: that the band values hold in every scene (they are single-frame measurements), that foliage moves with
+the wind in the G-buffer class, and that either mask helps foliage at all.
 
-No character or alpha source means `e->mask` is not written and FSR receives no reactive resource for that dispatch.
+### Method 2: alpha replay
 
-### Transparency and composition mask
+`alpha_draw` and `vk_alphaobj_execute` replay qualifying draw calls with the game's shaders into an R8 target cleared to
+1, depth-tested and with no depth writes. The value is `1 - retained_alpha`, capped at 0.9 for Reactive and 1.0 for T&C,
+zero outside covered draw pixels and on the sky (scene depth at the far plane).
 
-**Not supplied.** The code does not create or identify a T&C image, and no source detects reflections, animated textures,
-or other specialist shading. `fd.transparency` stays empty. If FSR's context lists T&C as usable, FSR receives no image
-for this input.
+A draw qualifies only when it belongs to the armed light/depth targets, target 0 has blend enabled, and the RGB blend
+uses either `ONE_MINUS_SRC_ALPHA` for destination alpha coverage or `SRC_ALPHA`/`ONE` for alpha-scaled ADD coverage.
+It must also have a usable, non-multisample pipeline, enabled depth test, disabled depth writes, and no feedback or
+storage resources. Plain additive blends, indirect and byte-index draws, line loops, and unbuilt pipelines are omitted.
+The log line `vk_exec: reactive mask draws` reports omitted draws by cause.
+
+The two blend kinds are separate sources, and each can feed Reactive, T&C or both:
+
+| Blend kind | Reactive | T&C |
+| --- | --- | --- |
+| Alpha-blended (`ONE_MINUS_SRC_ALPHA`) | `fsr_mask_r_alpha_blend`, on | `fsr_mask_tc_alpha_blend`, off |
+| Alpha-scaled additive (`SRC_ALPHA`, `ONE`) | `fsr_mask_r_alpha_add`, on | `fsr_mask_tc_alpha_add`, off |
+
+A draw is recorded once and drawn into the image of each mask it feeds; a blend kind no enabled source takes is not
+recorded at all, which saves the second pass. The replay does not know what a draw is: smoke, glass and water that pass
+the criteria above are taken alike, and the replay can widen the coverage where the original draw relied on stencil. The
+T&C alpha sources write the same coverage as the Reactive ones into the T&C image; they are experimental and off. The
+old `fsr_alpha = 0` still turns every alpha source off.
+
+No source for a mask means `e->mask` (or `e->tc`) is not written and FSR receives no resource for that input. The log line
+`fsr: masks given` says, whenever it changes, which masks were given and which the context takes.
+
+### Not implemented
+
+Sources that need a draw allowlist, additive-specific replay, replay of more draw types, temporal-residual detection or
+reflection data flow are not implemented. No source detects animated textures or reflections.
 
 ## Rule: no stand-ins
 

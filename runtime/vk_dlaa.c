@@ -30,6 +30,7 @@
 #include "vk_ffx.h"
 #include "vk_rec.h"
 #include "dlaa_debug.h"   // TODO(debug-view)
+#include "fsr_mask.h"
 #include "dlaa_mv_spv.h"
 #include "dlaa_view_spv.h"   // TODO(debug-view): made by tools/build_shaders.py from shaders/dlaa_view.comp
 
@@ -307,6 +308,9 @@ static struct {
         VkImage alpha;           // FSR: what is still see-through after the alpha-blended draws (R8, 1 = untouched), see mv_pass
         VmaAllocation alpha_mem;
         VkImageView alpha_view;
+        VkImage tc, alpha_tc;    // FSR: the T&C mask (R8) and the alpha draws' image for it, like alpha, for the draws that feed T&C
+        VmaAllocation tc_mem, alpha_tc_mem;
+        VkImageView tc_view, alpha_tc_view;
         int chars_cur, chars_ok; // chars[chars_cur] is written next; chars_ok: the other holds last frame's
         NgxHandle *feat;         // DLSS only: FSR's one context is D.fx, whatever the size
         uint64_t used;           // evals count when it last ran
@@ -376,6 +380,15 @@ static uint64_t dl_evals(void) { return D.evals; }
 // does not, the class mask of mv_pass, the reactive mask pass and its copy of the light target are not done.
 static int reactive_wanted(void) { return !fsr_backend() || vk_ffx_uses_reactive(D.fx.ctx); }
 
+// Whether the FSR context takes a T&C mask (vk_ffx_uses_transparency: 0 while there is no context yet, so the frame that
+// makes one goes without; FSR 3.1 takes it, FSR 4 says for itself). Where it does not, no T&C source is worked out.
+static int tc_wanted(void) { return fsr_backend() && vk_ffx_uses_transparency(D.fx.ctx); }
+
+// The mask images the frame's masks can go into: what the context takes (FSRM_DEST_* bits).
+static unsigned masks_wanted(void) {
+    return (reactive_wanted() ? FSRM_DEST_REACTIVE : 0u) | (tc_wanted() ? FSRM_DEST_TC : 0u);
+}
+
 static void dl_fail(const char *what, NgxResult r) {
     rt_log("dlaa: %s failed (%08x): DLAA off for this run", what, (unsigned)r);
     D.failed = 1;
@@ -407,6 +420,10 @@ static void free_size(struct Size *e) {
     if (e->mask) vmaDestroyImage(c->vma, e->mask, e->mask_mem);
     if (e->alpha_view) vkDestroyImageView(c->device, e->alpha_view, NULL);
     if (e->alpha) vmaDestroyImage(c->vma, e->alpha, e->alpha_mem);
+    if (e->tc_view) vkDestroyImageView(c->device, e->tc_view, NULL);
+    if (e->tc) vmaDestroyImage(c->vma, e->tc, e->tc_mem);
+    if (e->alpha_tc_view) vkDestroyImageView(c->device, e->alpha_tc_view, NULL);
+    if (e->alpha_tc) vmaDestroyImage(c->vma, e->alpha_tc, e->alpha_tc_mem);
     for (int i = 0; i < 2; i++) {
         if (e->chars_view[i]) vkDestroyImageView(c->device, e->chars_view[i], NULL);
         if (e->chars[i]) vmaDestroyImage(c->vma, e->chars[i], e->chars_mem[i]);
@@ -439,11 +456,14 @@ static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_
         !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[0], &e->chars_mem[0], &e->chars_view[0]) ||
         !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->chars[1], &e->chars_mem[1], &e->chars_view[1]) ||
         !image2d(w, h, VK_FORMAT_R8_UNORM, u8 | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                 &e->alpha, &e->alpha_mem, &e->alpha_view))
+                 &e->alpha, &e->alpha_mem, &e->alpha_view) ||
+        !image2d(w, h, VK_FORMAT_R8_UNORM, u8, &e->tc, &e->tc_mem, &e->tc_view) ||
+        !image2d(w, h, VK_FORMAT_R8_UNORM, u8 | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                 &e->alpha_tc, &e->alpha_tc_mem, &e->alpha_tc_view))
         return NULL;
-    VkImageMemoryBarrier2 ib[6];
-    VkImage im[6] = {e->out, e->mv, e->mask, e->chars[0], e->chars[1], e->alpha};
-    for (int i = 0; i < 6; i++)
+    VkImageMemoryBarrier2 ib[8];
+    VkImage im[8] = {e->out, e->mv, e->mask, e->chars[0], e->chars[1], e->alpha, e->tc, e->alpha_tc};
+    for (int i = 0; i < 8; i++)
         ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -452,7 +472,7 @@ static struct Size *size_for(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_
                                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im[i],
                                         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 6,
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 8,
                            .pImageMemoryBarriers = ib};
     vkCmdPipelineBarrier2(cb, &di);
     e->w = w, e->h = h, e->ow = ow, e->oh = oh;
@@ -552,13 +572,16 @@ static int unj_put(VkCommandBuffer cb, const float *blk, float sx, float sy, VkB
 
 // The most the alpha draws put into the reactive mask (FSR's own advice for a reactive value: not 1.0, which would take the
 // history off entirely); the characters' mask has its own (char_bias).
-#define DLAA_ALPHA_CAP 0.9f
+// (fsr_mask.c fsrmask_plan fills the caps now; this is where the Reactive one comes from.)
+
+// dlaa_mv.comp's push constants: 30 floats (size, jitter, mode, alpha, four class bands, outs), see mv_pass.
+#define DLAA_MV_PUSH_BYTES 120u
 
 static int mv_init(void) {
     if (D.mv_ok >= 0) return D.mv_ok;
     D.mv_ok = 0;
     const VkCtx *c = vk_ctx();
-    VkDescriptorSetLayoutBinding b[9] = {
+    VkDescriptorSetLayoutBinding b[11] = {
         {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -567,11 +590,13 @@ static int mv_init(void) {
         {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 9, .pBindings = b};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+                                           .bindingCount = 11, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, DLAA_MV_PUSH_BYTES};
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
                               .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                               .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
@@ -642,10 +667,12 @@ static int inv4(const double m[16], double o[16]) {
 }
 
 // The pass, recorded through the recorder like the replay's own commands. 0: no camera this frame (the vectors stay
-// zero and DLSS starts a new history). bias > 0 with this frame's G-buffer classes (D.ids) also writes e->mask, the
-// bias mask (dlaa_mv.comp); *masked says whether it did.
-static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float jy, float bias, int alpha_on, int *masked) {
-    *masked = 0;
+// zero and DLSS starts a new history). The plan (fsr_mask.h) says which mask sources are on: with class sources and this
+// frame's G-buffer classes (D.ids) the pass also writes e->mask (Reactive) and e->tc (T&C), and the alpha draws of the
+// plan's blend kinds go into e->alpha / e->alpha_tc first; *masks gets the FSRM_DEST_* bits of the masks it wrote.
+static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float jy, const FsrMaskPlan *mp,
+                   unsigned *masks) {
+    *masks = 0;
     VkCommandBuffer cb = ex->cb;
     uint32_t w = e->w, h = e->h;
     VkDescriptorBufferInfo cam;
@@ -700,7 +727,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     // The class mask needs the G-buffer at the scene size; otherwise bindings 4-7 get the mask images as stand-ins
     // (the shader returns before reading them with bias 0).
     const VkExecTarget *ids = &D.ids;
-    int use = bias > 0 && D.ids_ok && ids->image && ids->width == w && ids->height == h && !ids->is3d;
+    int use = mp->classes_dests && D.ids_ok && ids->image && ids->width == w && ids->height == h && !ids->is3d;
     VkImageView iv = use ? vk_exec_target_view(ids->img, ids->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
                                                ids->level, ids->base_layer, 1, 0)
                          : e->mask_view;
@@ -709,18 +736,29 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     VkDescriptorImageInfo mki = {VK_NULL_HANDLE, e->mask_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo cpi = {VK_NULL_HANDLE, e->chars_view[cur_c ^ 1], VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo coi = {VK_NULL_HANDLE, e->chars_view[cur_c], VK_IMAGE_LAYOUT_GENERAL};
-    // The reactive mask's alpha draws (FSR, vk_exec_draw.c alpha_draw): into e->alpha, cleared to 1, over the scene depth
-    int alpha_used = 0;
-    if (alpha_on) {
+    // The alpha draws (FSR, vk_exec_draw.c alpha_draw) for the masks the plan feeds from them: into e->alpha (Reactive) and
+    // e->alpha_tc (T&C), each cleared to 1, over the scene depth. alpha_used: the images that got draws.
+    unsigned alpha_used = 0;
+    if (mp->alpha_dests) {
         VkClearColorValue one = {{1, 1, 1, 1}};
         VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(cb, e->alpha, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &all);
+        VkImageView tg[FSRM_TARGETS] = {NULL, NULL};
+        if (mp->alpha_dests & FSRM_DEST_REACTIVE) {
+            vkCmdClearColorImage(cb, e->alpha, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &all);
+            tg[FSRM_REACTIVE] = e->alpha_view;
+        }
+        if (mp->alpha_dests & FSRM_DEST_TC) {
+            vkCmdClearColorImage(cb, e->alpha_tc, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &all);
+            tg[FSRM_TC] = e->alpha_tc_view;
+        }
         full_barrier(cb);
-        alpha_used = vk_alphaobj_execute(ex, e->alpha_view, zv, D.depth.format, w, h) > 0;
+        alpha_used = vk_alphaobj_execute(ex, tg, zv, D.depth.format, w, h);
         full_barrier(cb);
     }
     VkDescriptorImageInfo ali = {D.mv_samp, e->alpha_view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr[9] = {
+    VkDescriptorImageInfo tci = {VK_NULL_HANDLE, e->tc_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo atci = {D.mv_samp, e->alpha_tc_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[11] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &zi},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
@@ -738,13 +776,28 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 7, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &coi},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 8, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ali}};
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ali},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 9, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &tci},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 10, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &atci}};
     times_begin(cb);
     times_mark(cb, T_MV0);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.mv_pipe);
-    rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.mv_layout, 0, 9, wr);
-    float pc[8] = {(float)w, (float)h, jx, jy, use ? bias : 0.0f, use && e->chars_ok ? 1.0f : 0.0f,
-                   alpha_used ? 1.0f : 0.0f, DLAA_ALPHA_CAP};
+    rec_push(vk_pipeline_push_fn(), cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.mv_layout, 0, 11, wr);
+    // The masks written: a class source needs this frame's classes (use), an alpha source its draws (alpha_used)
+    unsigned outs = (use ? mp->classes_dests : 0u) | alpha_used;
+    float pc[DLAA_MV_PUSH_BYTES / 4] = {(float)w, (float)h, jx, jy,
+                                        use ? 1.0f : 0.0f, use && e->chars_ok ? 1.0f : 0.0f,
+                                        use ? mp->footprint : 0.0f, 0.0f,
+                                        alpha_used & FSRM_DEST_REACTIVE ? 1.0f : 0.0f,
+                                        alpha_used & FSRM_DEST_TC ? 1.0f : 0.0f,
+                                        mp->alpha_cap[FSRM_REACTIVE], mp->alpha_cap[FSRM_TC]};
+    for (int i = 0; i < FSRM_CLASSES; i++) {
+        pc[12 + 4 * i] = (float)mp->cls[i].lo, pc[13 + 4 * i] = (float)mp->cls[i].hi;
+        pc[14 + 4 * i] = use ? mp->cls[i].reactive : 0.0f, pc[15 + 4 * i] = use ? mp->cls[i].tc : 0.0f;
+    }
+    pc[28] = outs & FSRM_DEST_REACTIVE ? 1.0f : 0.0f, pc[29] = outs & FSRM_DEST_TC ? 1.0f : 0.0f;
     vkCmdPushConstants(cb, D.mv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     full_barrier(cb);
@@ -760,7 +813,7 @@ static int mv_pass(VkExec *ex, struct Size *e, VkImageView zv, float jx, float j
     D.mv_frames++;
     if (use) e->chars_cur ^= 1, e->chars_ok = 1, D.masked++;
     else e->chars_ok = 0;
-    *masked = use || alpha_used;
+    *masks = outs;
     return 1;
 }
 
@@ -949,20 +1002,17 @@ static int ended_at(const VkExec *ex) {
     return !ex->chunked || ex->fence != D.end_fence || ex->pos >= D.end_pos;
 }
 
-// TOTK_FSR_ALPHA=0 (test): no alpha draws for the reactive mask.
-static int alpha_capture(void) {
-    static int on = -1;
-    if (on < 0) on = rt_knob("FSR_ALPHA", "1");
-    return on;
+// vk_exec_draw.c, for each draw into a blend-enabled target 0: 1 when it is drawn into the armed scene targets, some alpha
+// source is on and the FSR context takes the mask it feeds, so that the draw may go into a mask (alpha_draw lists the
+// ones that qualify, by blend kind through vk_dlaa_alpha_dests).
+int vk_dlaa_reactive_alpha(const VkExec *ex) {
+    if (!fsr_backend() || !dl_active() || !D.armed || ended_at(ex)) return 0;
+    if (!ex->color[0].image || ex->color[0].image != D.color.image || ex->depth.image != D.depth.image) return 0;
+    return ((fsrmask_alpha_dests(FSRM_ALPHA_BLEND) | fsrmask_alpha_dests(FSRM_ALPHA_ADD)) & masks_wanted()) != 0;
 }
 
-// vk_exec_draw.c, for each draw into a blend-enabled target 0: 1 when it is drawn into the armed scene targets and the
-// FSR context takes a reactive mask, so that the draw may go into it (alpha_draw lists the ones that qualify).
-int vk_dlaa_reactive_alpha(const VkExec *ex) {
-    if (!alpha_capture() || !fsr_backend() || !dl_active() || !D.armed || ended_at(ex)) return 0;
-    if (!ex->color[0].image || ex->color[0].image != D.color.image || ex->depth.image != D.depth.image) return 0;
-    return reactive_wanted();
-}
+// The masks (FSRM_DEST_* bits) a draw of this blend kind goes into: the sources that are on, for the masks the context takes.
+unsigned vk_dlaa_alpha_dests(int blend_class) { return fsrmask_alpha_dests(blend_class) & masks_wanted(); }
 
 // The viewport and scissor of the scene's draws against the render area and the depth target they draw into, logged once
 // for each distinct combination (eight at most). The render resolution the upscaler gets is the size of the light target
@@ -1434,6 +1484,14 @@ void dlaa_debug_set(int mode, int color, int view) {
 }
 int dlaa_debug_available(void) { return vk_dlaa_fsr_on(); }
 
+// For the menu's mask rows: 1 when an FSR context exists, and then whether it takes the Reactive and the T&C input.
+// 0 (outputs untouched) before the first context, when nothing is known.
+int vk_dlaa_fsr_inputs(int *reactive, int *tc) {
+    if (!D.fx.ctx) return 0;
+    *reactive = vk_ffx_uses_reactive(D.fx.ctx), *tc = vk_ffx_uses_transparency(D.fx.ctx);
+    return 1;
+}
+
 int dlaa_debug_labels(DlaaDebugLabel *out, int max) {
     for (int tries = 0; tries < 4; tries++) {
         int s0 = __atomic_load_n(&V.seq, __ATOMIC_ACQUIRE);
@@ -1551,19 +1609,19 @@ fail:
 }
 
 // Draws the inputs view into e->out (after FSR's dispatch, before the result is copied on) and publishes its labels,
-// together with FSR's own (labels_a, n_a) where both parts are on. mask_view: the Reactive mask handed to FSR (NULL: none).
+// together with FSR's own (labels_a, n_a) where both parts are on. mask_view, tc_view: the Reactive and T&C masks handed to FSR (NULL: none).
 static void debug_inputs(VkCommandBuffer cb, struct Size *e, VkImageView cv, VkImageView zv, VkImageView mask_view,
-                         int transp_given, int mode, int color, int view, DlaaDebugLabel *labels_a, int n_a, float cn, float cf,
+                         VkImageView tc_view, int mode, int color, int view, DlaaDebugLabel *labels_a, int n_a, float cn, float cf,
                          int inv, int inf) {
     if (!D.mv_samp || debug_view_init() <= 0) return;
-    int have[4] = {mask_view != VK_NULL_HANDLE, transp_given, 1, 1};
+    int have[4] = {mask_view != VK_NULL_HANDLE, tc_view != VK_NULL_HANDLE, 1, 1};
     struct DvTile tile[4];
     DlaaDebugLabel lab[16];
     int nl = 0, nt = debug_layout_b(mode, color, view, have, tile, lab, &nl);
     // the stand-in where an input was not supplied is never read (the shader draws black for present = 0)
     VkImageView rv = mask_view ? mask_view : e->mask_view;
     VkDescriptorImageInfo ri = {D.mv_samp, rv, VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo ti = {D.mv_samp, rv, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ti = {D.mv_samp, tc_view ? tc_view : rv, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo mi = {D.mv_samp, e->mv_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo zi = {D.mv_samp, zv, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo ci = {D.mv_samp, cv, VK_IMAGE_LAYOUT_GENERAL};
@@ -1628,8 +1686,11 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     float jx = D.jit_used ? D.ux : 0.0f, jy = D.jit_used ? D.uy : 0.0f;
     static int no_mv = -1;
     if (no_mv < 0) no_mv = !rt_knob("DLAA_MV", "1");   // TOTK_DLAA_MV=0: zero motion (test)
-    int masked = 0, want_mask = reactive_wanted();
-    if (no_mv || !mv_pass(ex, e, zv, jx, jy, want_mask ? char_bias() : 0.0f, fsr && want_mask && alpha_capture(), &masked)) {
+    int want_mask = reactive_wanted();
+    unsigned masks = 0;   // the masks mv_pass wrote (FSRM_DEST_* bits)
+    FsrMaskPlan plan;
+    fsrmask_plan(&plan, fsr, char_bias(), want_mask, tc_wanted());
+    if (no_mv || !mv_pass(ex, e, zv, jx, jy, &plan, &masks)) {
         VkClearColorValue zero = {{0, 0, 0, 0}};
         VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, e->mv, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
@@ -1678,13 +1739,21 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
                             .jx = jx, .jy = jy, .dt_ms = dt_ms, .cam_near = cn, .cam_far = cf, .fov_y = fov,
                             .sharpness = dbg_a ? 0.0f : (float)sharp / 100.0f,   // the Debug view is read unsharpened
                             .reset = D.reset, .debug_view = dbg_a};
-        // Reactive mask: e->mask, what mv_pass wrote (the characters' class mask and the alpha of the alpha-blended draws).
-        // Transparency and composition mask: none. No source for it is implemented, and none is made up: fd.transparency
-        // stays empty and vk_ffx_dispatch hands FSR nothing there (docs/dlaa.md).
-        if (masked) fd.reactive = (VkFfxImage){e->mask, VK_FORMAT_R8_UNORM, w, h};
-        static int tc_logged;
-        if (!tc_logged++)
-            rt_log("fsr: transparency and composition mask: not supplied (no source for it is implemented)");
+        // Reactive mask: e->mask, T&C mask: e->tc, each only where mv_pass wrote it from at least one source that is on
+        // (fsr_mask.h). A mask with no source this frame is not supplied: fd stays empty there and vk_ffx_dispatch hands
+        // FSR nothing (docs/dlaa.md, "Rule: no stand-ins"). The T&C image is its own, never a copy of the Reactive one.
+        if (masks & FSRM_DEST_REACTIVE) fd.reactive = (VkFfxImage){e->mask, VK_FORMAT_R8_UNORM, w, h};
+        if (masks & FSRM_DEST_TC) fd.transparency = (VkFfxImage){e->tc, VK_FORMAT_R8_UNORM, w, h};
+        static unsigned logged_masks = ~0u;
+        if (masks != logged_masks) {
+            logged_masks = masks;
+            rt_log("fsr: masks given: reactive %s, transparency and composition %s (sources on: reactive %s, T&C %s; the "
+                   "context takes reactive %s, T&C %s)",
+                   masks & FSRM_DEST_REACTIVE ? "yes" : "not supplied", masks & FSRM_DEST_TC ? "yes" : "not supplied",
+                   plan.classes_dests & FSRM_DEST_REACTIVE || plan.alpha_dests & FSRM_DEST_REACTIVE ? "yes" : "none",
+                   plan.classes_dests & FSRM_DEST_TC || plan.alpha_dests & FSRM_DEST_TC ? "yes" : "none",
+                   vk_ffx_uses_reactive(fx) ? "yes" : "no", vk_ffx_uses_transparency(fx) ? "yes" : "no");
+        }
         c0 = timed ? kern_now_ns() : 0;
         int ok = vk_ffx_dispatch(fx, cb, &fd);
         if (timed) T.cpu_ngx += kern_now_ns() - c0;
@@ -1693,9 +1762,10 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
             DlaaDebugLabel la[8];
             int na = dbg_a ? debug_labels_a(la, dm != DLAA_DEBUG_BOTH) : 0;
             if (dbg_b) {
-                VkImageView rv = masked ? e->mask_view : VK_NULL_HANDLE;
+                VkImageView rv = masks & FSRM_DEST_REACTIVE ? e->mask_view : VK_NULL_HANDLE;
                 if (!vk_ffx_uses_reactive(fx)) rv = VK_NULL_HANDLE;   // the context does not take it: not supplied
-                debug_inputs(cb, e, cv, zv, rv, 0,
+                VkImageView tv = masks & FSRM_DEST_TC && vk_ffx_uses_transparency(fx) ? e->tc_view : VK_NULL_HANDLE;
+                debug_inputs(cb, e, cv, zv, rv, tv,
                              dbg_a ? dm : DLAA_DEBUG_INPUTS, dc, dv, la, na,
                              cn, cf, inv, inf);
             } else {
@@ -1755,7 +1825,7 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
     // none. The parameter object is reused, so it is cleared explicitly.
     NgxResourceVK rk = mk ? res_image(mk->mask_view, mk->mask, VK_FORMAT_R8_UNORM, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0)
                           : res_image(e->mask_view, e->mask, VK_FORMAT_R8_UNORM, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
-    p_setp(p, "DLSS.Input.Bias.Current.Color.Mask", mk || masked ? (void *)&rk : NULL);
+    p_setp(p, "DLSS.Input.Bias.Current.Color.Mask", mk || masks & FSRM_DEST_REACTIVE ? (void *)&rk : NULL);
     p_setu(p, "DLSS.Input.Bias.Current.Color.Subrect.Base.X", 0);
     p_setu(p, "DLSS.Input.Bias.Current.Color.Subrect.Base.Y", 0);
     p_setf(p, "MV.Scale.X", 1.0f);

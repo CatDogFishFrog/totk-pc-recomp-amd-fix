@@ -46,11 +46,15 @@ void vk_mvprev_draw(VkExec *ex);   // vk_mvprev.c: notes the scene draw's object
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,
                      uint32_t h);
 int vk_dlaa_prev_camera(VkDescriptorBufferInfo *out, float jitter[2]);
-// Reactive mask from alpha (FSR, vk_exec_draw.c): the alpha-blended draws into the armed light target are listed again
-// during the replay (vk_dlaa_reactive_alpha says whether a draw is one the mask may take) and mv_pass records them
-// with vk_alphaobj_execute into an R8 image cleared to 1, which dlaa_mv.comp turns into the mask. Returns the draws.
+// Mask images from alpha (FSR, vk_exec_draw.c): the alpha-blended draws into the armed light target are listed again
+// during the replay (vk_dlaa_reactive_alpha says whether any draw may be taken, vk_dlaa_alpha_dests which masks a draw of
+// a blend kind (FSRM_ALPHA_*) goes into: FSRM_DEST_* bits, from the settings of fsr_mask.h) and mv_pass records them with
+// vk_alphaobj_execute into R8 images cleared to 1, one per mask (target[FSRM_REACTIVE], target[FSRM_TC]; NULL: that mask
+// takes none), which dlaa_mv.comp turns into mask values. Returns the FSRM_DEST_* bits of the images that got draws.
 int vk_dlaa_reactive_alpha(const VkExec *ex);
-int vk_alphaobj_execute(VkExec *ex, VkImageView target, VkImageView depth, VkFormat depth_fmt, uint32_t w, uint32_t h);
+unsigned vk_dlaa_alpha_dests(int blend_class);
+unsigned vk_alphaobj_execute(VkExec *ex, const VkImageView target[2], VkImageView depth, VkFormat depth_fmt, uint32_t w,
+                             uint32_t h);
 // nvn_api_core.c ov_memcpy, after a 64-byte copy on the game's thread: the camera jitter of 1.4.3 (vk_dlaa.c).
 void vk_dlaa_camera_copied(uint64_t lr, uint64_t dst, uint64_t off);
 void vk_dlaa_game_present(void);   // vk_backend.c, each of the game's presents, on its thread

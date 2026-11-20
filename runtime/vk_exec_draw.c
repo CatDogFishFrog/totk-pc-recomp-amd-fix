@@ -30,6 +30,7 @@
 #include "vk_exec.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "fsr_mask.h"
 #include "memx.h"
 
 #define MAX_BINDINGS 128
@@ -3506,8 +3507,9 @@ typedef struct {
     uint64_t cam;                // the draw's camera block (c4), this frame's
     uint32_t first;              // first vertex of a draw without indices
     uint8_t kind, indexed;       // MO_MOTION or MO_ALPHA; 0: vkCmdDraw
+    uint8_t dests;               // MO_ALPHA: the masks it goes into (FSRM_DEST_* bits)
 } MoDraw;
-enum { MO_MOTION, MO_ALPHA };   // MO_ALPHA: the reactive mask's draws (alpha_draw_), recorded by vk_alphaobj_execute
+enum { MO_MOTION, MO_ALPHA };   // MO_ALPHA: the mask images' alpha draws (alpha_draw_), recorded by vk_alphaobj_execute
 typedef struct { VkBuffer b[17]; VkDeviceSize o[17], sz[17], str[17]; } MoVb;
 static struct {
     uint64_t frame, fence;       // the frame and submission the list belongs to
@@ -4149,18 +4151,25 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
 // SRC_ALPHA with destination ONE (additive scaled by alpha), equation ADD. Anything else is counted, by cause, in the log
 // line of vk_alphaobj_execute and is not in the mask: blends without an alpha factor (plain additive), line
 // loops, byte indices, indirect draws, and draws whose pipeline was still being built. Quads are taken (their generated
-// indices are reused). TOTK_FSR_ALPHA=0
-// turns the capture off (test).
+// indices are reused). The two blend kinds are separate sources of the masks (fsr_mask.h, FSRM_ALPHA_*), each switched
+// on for the Reactive mask, the T&C mask or both: a draw whose kind feeds no mask is counted and not recorded, and one
+// that feeds both is recorded once and drawn into both images (vk_alphaobj_execute). TOTK_FSR_ALPHA=0 still turns every
+// alpha source off (fsr_mask.c).
 static struct {
     uint64_t listed, indexed, plain;                                  // draws recorded in the list
     uint64_t no_factor, no_test, writes_depth, feedback, quads, indirect, storage, building;   // seen, not listed
+    uint64_t kind_off;                                                // blend kind qualifies but no mask takes it
+    uint64_t per_dest[FSRM_TARGETS];                                  // draws listed for each mask
     uint64_t dropped, ran, ran_draws;
 } AL;
 
-static int alpha_coverage_blend(const blend_st *b) {
-    if (b->eq_rgb != NVN_BLEND_EQUATION_ADD) return 0;
-    return b->dst_rgb == NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA ||
-           (b->src_rgb == NVN_BLEND_FUNC_SRC_ALPHA && b->dst_rgb == NVN_BLEND_FUNC_ONE);
+// The blend kind of a draw whose alpha is its coverage (FSRM_ALPHA_BLEND: destination factor ONE_MINUS_SRC_ALPHA;
+// FSRM_ALPHA_ADD: SRC_ALPHA over ONE), -1 for any other blend.
+static int alpha_blend_class(const blend_st *b) {
+    if (b->eq_rgb != NVN_BLEND_EQUATION_ADD) return -1;
+    if (b->dst_rgb == NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA) return FSRM_ALPHA_BLEND;
+    if (b->src_rgb == NVN_BLEND_FUNC_SRC_ALPHA && b->dst_rgb == NVN_BLEND_FUNC_ONE) return FSRM_ALPHA_ADD;
+    return -1;
 }
 
 // A draw that vk_dlaa_reactive_alpha accepted and the replay has just recorded: listed when it qualifies. count,
@@ -4174,7 +4183,10 @@ static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instan
     if (!os->ds.dt) { AL.no_test++; return; }
     if (os->ds.dw) { AL.writes_depth++; return; }
     if (os->feedback) { AL.feedback++; return; }
-    if (!alpha_coverage_blend(&os->blend[0])) { AL.no_factor++; return; }
+    int bclass = alpha_blend_class(&os->blend[0]);
+    if (bclass < 0) { AL.no_factor++; return; }
+    unsigned dests = vk_dlaa_alpha_dests(bclass);
+    if (!dests) { AL.kind_off++; return; }   // no mask takes this blend kind (the menu's FSR mask sources)
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != z->format) mo_begin(ex, frame);
     VkPipeState ms = *os;
@@ -4212,7 +4224,7 @@ static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instan
     memset(mo_ovr, 0, sizeof mo_ovr);
     mo_ovr_on = 0;   // the draw's own descriptors
     if (!mo_desc(ex, info, q)) { AL.storage++; return; }
-    q->kind = MO_ALPHA, q->indexed = (uint8_t)indexed, q->first = first, q->cam = 0;
+    q->kind = MO_ALPHA, q->indexed = (uint8_t)indexed, q->first = first, q->cam = 0, q->dests = (uint8_t)dests;
     q->pipe = pipe, q->info = info;
     if (!MQ.nst || memcmp(&MQ.st[MQ.nst - 1], &ms, sizeof ms)) {
         MQ.st = mo_grow(MQ.st, &MQ.cst, MQ.nst + 1, sizeof *MQ.st);
@@ -4227,6 +4239,7 @@ static void alpha_draw_(VkExec *ex, int indexed, uint32_t count, uint32_t instan
     q->count = count, q->instances = instances, q->base_vertex = base_vertex, q->base_instance = base_instance;
     MQ.n++;
     AL.listed++, indexed ? AL.indexed++ : AL.plain++;
+    for (int t = 0; t < FSRM_TARGETS; t++) AL.per_dest[t] += (dests >> t) & 1u;
 }
 
 // Called for every draw into a blend-enabled target 0 (the caller has checked that cheaply); what is not for the mask
@@ -4242,20 +4255,24 @@ static void alpha_draw(VkExec *ex, int kind, uint32_t count, uint32_t instances,
     if (ex->chunked) plat_mutex_unlock(&mo_lock);
 }
 
-// The list's alpha draws, recorded into target (R8, cleared to 1 by the caller) with the scene depth: 0 when the frame
-// has none. The motion draws stay in the list for vk_mvobj_execute.
-int vk_alphaobj_execute(VkExec *ex, VkImageView target, VkImageView depth, VkFormat depth_fmt, uint32_t w, uint32_t h) {
+// The list's alpha draws, each recorded into the image of every mask it feeds (target[FSRM_REACTIVE], target[FSRM_TC]: R8,
+// cleared to 1 by the caller, NULL: that mask takes none) with the scene depth. Returns the FSRM_DEST_* bits of the images
+// that got draws, 0 when the frame has none. The motion draws stay in the list for vk_mvobj_execute.
+unsigned vk_alphaobj_execute(VkExec *ex, const VkImageView target[FSRM_TARGETS], VkImageView depth, VkFormat depth_fmt,
+                             uint32_t w, uint32_t h) {
     static uint64_t frames;
     if (++frames % 600 == 0)
         rt_log("vk_exec: reactive mask draws, in %llu frames: %llu recorded (%llu indexed, %llu without indices); not in the "
                "mask: %llu blends without an alpha factor, %llu without depth test, %llu writing depth, %llu feedback, "
-               "%llu line loops or byte indices, %llu indirect, %llu with storage resources, %llu waiting for a pipeline; %llu "
-               "lists dropped; %llu passes, %.1f draws a pass", (unsigned long long)frames, (unsigned long long)AL.listed,
+               "%llu line loops or byte indices, %llu indirect, %llu with storage resources, %llu waiting for a pipeline, %llu of a "
+               "blend kind no mask takes; %llu lists dropped; %llu passes, %.1f draws a pass; recorded for the reactive mask "
+               "%llu, for the T&C mask %llu", (unsigned long long)frames, (unsigned long long)AL.listed,
                (unsigned long long)AL.indexed, (unsigned long long)AL.plain, (unsigned long long)AL.no_factor,
                (unsigned long long)AL.no_test, (unsigned long long)AL.writes_depth, (unsigned long long)AL.feedback,
                (unsigned long long)AL.quads, (unsigned long long)AL.indirect, (unsigned long long)AL.storage,
-               (unsigned long long)AL.building, (unsigned long long)AL.dropped, (unsigned long long)AL.ran,
-               AL.ran ? (double)AL.ran_draws / (double)AL.ran : 0.0);
+               (unsigned long long)AL.building, (unsigned long long)AL.kind_off, (unsigned long long)AL.dropped,
+               (unsigned long long)AL.ran, AL.ran ? (double)AL.ran_draws / (double)AL.ran : 0.0,
+               (unsigned long long)AL.per_dest[FSRM_REACTIVE], (unsigned long long)AL.per_dest[FSRM_TC]);
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (!MQ.n || MQ.frame != frame || MQ.fence != ex->fence || MQ.depth_fmt != depth_fmt) return 0;
     static MoDraw *ab;
@@ -4271,22 +4288,38 @@ int vk_alphaobj_execute(VkExec *ex, VkImageView target, VkImageView depth, VkFor
     }
     MQ.n = kept;
     VkCommandBuffer cb = ex->cb;
-    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = target,
-                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-    VkRenderingAttachmentInfo da = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = depth,
-                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
-                          .colorAttachmentCount = 1, .pColorAttachments = &ca, .pDepthAttachment = &da};
-    vkCmdBeginRendering(cb, &ri);
-    mo_emit_range(cb, ab, na);
-    vkCmdEndRendering(cb);
+    static MoDraw *sel;
+    static int selcap;
+    unsigned got = 0;
+    for (int t = 0; t < FSRM_TARGETS; t++) {
+        if (!target[t]) continue;
+        int ns = 0;
+        for (int i = 0; i < na; i++)
+            if (ab[i].dests >> t & 1u) ns++;
+        if (!ns) continue;
+        sel = mo_grow(sel, &selcap, ns, sizeof *sel);
+        ns = 0;
+        for (int i = 0; i < na; i++)
+            if (ab[i].dests >> t & 1u) sel[ns++] = ab[i];
+        VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = target[t],
+                                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingAttachmentInfo da = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = depth,
+                                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
+                              .colorAttachmentCount = 1, .pColorAttachments = &ca, .pDepthAttachment = &da};
+        vkCmdBeginRendering(cb, &ri);
+        mo_emit_range(cb, sel, ns);
+        vkCmdEndRendering(cb);
+        ex->recorded += ns;
+        AL.ran++, AL.ran_draws += (uint64_t)ns;
+        got |= t == FSRM_TC ? FSRM_DEST_TC : FSRM_DEST_REACTIVE;
+    }
+    if (!got) return 0;
     vk_exec_draw_new_cb(ex);
     ex->dirty = VK_EXEC_DIRTY_ALL;
-    ex->recorded += na;
-    AL.ran++, AL.ran_draws += (uint64_t)na;
-    return na;
+    return got;
 }
 
 int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth, VkFormat depth_fmt, uint32_t w,

@@ -38,6 +38,7 @@ extern "C" {
 #include "amiibo.h"
 #include "cheats.h"
 #include "dlaa_debug.h"   // TODO(debug-view)
+#include "fsr_mask.h"
 #include "cfg.h"
 #include "fs.h"
 #include "input.h"
@@ -822,6 +823,31 @@ static void rows_color(void) {
     }
 }
 
+// The FSR mask sources (fsr_mask.c): one row per source of the Reactive and the T&C mask, built from the source table, so a
+// new source is a table row and a catalog text, not a change here. Each row is a setting of its own; the enabled sources
+// combine. A source with a strength has a second row under it. Shown for AMD FSR (the setting, like rows_upscaler); the
+// Debug view below shows what the masks hold.
+static void rows_fsr_masks(void) {
+    opt_group(UI_MENU_FSRM_GROUP);
+    if (upscaler_choice() < 2) {
+        opt_text(UI_MENU_FSRM_NEEDS_FSR, true);
+        return;
+    }
+    opt_text(UI_MENU_FSRM_INTRO);
+    int takes[FSRM_TARGETS] = {1, 1};
+    bool known = dlaa_debug_available() && vk_dlaa_fsr_inputs(&takes[FSRM_REACTIVE], &takes[FSRM_TC]);
+    int shown = -1;
+    for (int i = 0; const FsrMaskSource *s = fsrmask_source(i); i++) {
+        if ((int)s->target != shown) {   // the sources of a mask are together in the table
+            shown = (int)s->target;
+            opt_group(s->target == FSRM_TC ? UI_MENU_FSRM_TC_GROUP : UI_MENU_FSRM_R_GROUP);
+            if (known && !takes[shown]) opt_text(UI_MENU_FSRM_UNUSED, true);
+        }
+        opt_toggle(s->key, s->label, s->desc);
+        if (s->level_key) opt_slider(s->level_key, s->level_label, 0, 100, s->level_desc, 5, "%.0f %%");
+    }
+}
+
 // TODO(debug-view): the Debug section of the Video tab and its labels (dlaa_debug.h); remove with the rest after the tests.
 // Plain text rows, not settings of the cfg table: the state is not saved and is off at every start.
 static void rows_debug(void) {
@@ -889,6 +915,7 @@ static void tab_screen(float scale) {
     opt_slider("TOTK_HDR_GAME_NITS", UI_MENU_HDR_GAME, 80, 500, UI_MENU_HDR_GAME_DESC, 5, "%.0f");
     opt_slider("TOTK_HDR_UI_NITS", UI_MENU_HDR_UI, 80, 500, UI_MENU_HDR_UI_DESC, 5, "%.0f");
     opt_slider("TOTK_HDR_HUE", UI_MENU_HDR_HUE, 0, 100, UI_MENU_HDR_HUE_DESC, 5, "%.0f %%");
+    rows_fsr_masks();
     rows_debug();   // TODO(debug-view)
     opt_end();
 }

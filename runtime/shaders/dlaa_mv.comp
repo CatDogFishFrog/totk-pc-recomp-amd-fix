@@ -6,15 +6,18 @@
 // The camera block is TotK's scene uniform block (bound as c4 in the scene's vertex shaders): vec4 rows 3-6 are the
 // view-projection, rows of a row-major 4x4 with OpenGL clip depth (-w..w). The replay's viewports have negative
 // heights, so window y grows downwards from ndc y = +1, and depth is z_ndc * 0.5 + 0.5.
-// With pc.bias > 0 the pass also writes DLSS's bias mask (vk_dlaa.c, "characters"): G-buffer target 0 carries an object
-// class in green, above 64/255 for characters, creatures and what they hold (Link 253, others 125, held items 160;
-// terrain 0, foliage 32). A pixel gets pc.bias when a character covers it now, or covered the place its surface came
-// from last frame (the previous class mask, read through the motion vector, 3x3): there the history holds a moving
-// character that the camera-only vector does not follow, which is the trail. chars_out keeps this frame's mask for the
-// next; chars_prev is last frame's (pc.prev_ok 0: none).
-// FSR's reactive mask also takes the alpha of the alpha-blended draws (vk_exec_draw.c alpha_draw): alpha_tex holds what
-// those draws left see-through (1 = untouched), so 1 - alpha_tex is their accumulated opacity, at most pc.alpha_cap; the
-// sky (depth at the far plane) takes none. The mask is the larger of the two (characters, alpha).
+// The pass also writes FSR's two mask inputs (fsr_mask.h: every source is a setting, vk_dlaa.c fills the push constants
+// from fsrmask_plan). G-buffer target 0 carries an object class in green (Link 253, other characters and creatures 125,
+// held items 160, foliage 32, terrain 0: single-frame measurements). pc.cls[i] describes the class i: its band of green
+// (x..y, 0..255) and the value a pixel of it gives the Reactive mask (z) and the T&C mask (w), 0: it feeds that mask
+// nothing. Classes 0..2 are the characters: a pixel of one that feeds the Reactive mask is part of the footprint
+// (chars_out keeps this frame's for the next; chars_prev is last frame's), and a pixel whose surface came from the
+// footprint's place last frame (read through the motion vector, 3x3) gets pc.mode.z in the Reactive mask: there the
+// history holds a moving character that the camera-only vector does not follow, which is the trail.
+// The alpha-blended draws (vk_exec_draw.c alpha_draw) are recorded into up to two R8 images, one per mask: alpha_tex
+// and alpha_tc_tex hold what those draws left see-through (1 = untouched), so 1 - alpha is their accumulated opacity,
+// at most pc.alpha.z (Reactive) or pc.alpha.w (T&C); the sky (depth at the far plane) takes none. Each mask is the
+// larger of its sources. mask_out and tc_out are written only where pc.outs says the mask has a source this frame.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D depth_tex;
 layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
@@ -25,13 +28,18 @@ layout(binding = 5, r8) uniform writeonly image2D mask_out;
 layout(binding = 6, r8) uniform readonly image2D chars_prev;
 layout(binding = 7, r8) uniform writeonly image2D chars_out;
 layout(binding = 8) uniform sampler2D alpha_tex;
+layout(binding = 9, r8) uniform writeonly image2D tc_out;
+layout(binding = 10) uniform sampler2D alpha_tc_tex;
 layout(push_constant) uniform P {
     vec2 size;     // render size in pixels
     vec2 jitter;   // this frame's jitter, pixels, as the scene was drawn (window x right, y down)
-    float bias;    // the mask value for character pixels; 0: no mask (bindings 4-7 unused)
-    float prev_ok; // 1: chars_prev holds last frame's class mask at this size
-    float alpha_on;   // 1: alpha_tex holds this frame's alpha draws
-    float alpha_cap;  // the largest mask value the alpha draws give
+    vec4 mode;     // x: 1 when ids_tex holds this frame's G-buffer classes (bindings 4, 6, 7 are used);
+                   // y: 1 when chars_prev holds last frame's footprint at this size;
+                   // z: the Reactive value of the previous frame's footprint, 0: none; w: unused
+    vec4 alpha;    // x, y: 1 when alpha_tex / alpha_tc_tex holds this frame's alpha draws; z, w: the most they give
+                   // the Reactive / the T&C mask
+    vec4 cls[4];   // per class: x, y the band of green (0..255), z the Reactive value, w the T&C value
+    vec2 outs;     // x: 1 writes mask_out (the Reactive mask), y: 1 writes tc_out (the T&C mask)
 } pc;
 
 mat4 vp(vec4 a, vec4 b, vec4 c, vec4 d) { return transpose(mat4(a, b, c, d)); }
@@ -55,20 +63,30 @@ void main() {
         }
     }
     imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
-    float rm = 0.0;
-    if (pc.bias > 0.0) {
-        float ch = texelFetch(ids_tex, p, 0).g > 64.0 / 255.0 ? 1.0 : 0.0;
-        imageStore(chars_out, p, vec4(ch));
+    float rm = 0.0, tc = 0.0;
+    if (pc.mode.x > 0.5) {
+        int gc = int(texelFetch(ids_tex, p, 0).g * 255.0 + 0.5);   // the class: green as 0..255
+        float foot = 0.0;
+        for (int i = 0; i < 4; i++) {
+            if (gc < int(pc.cls[i].x) || gc > int(pc.cls[i].y)) continue;
+            rm = max(rm, pc.cls[i].z);
+            tc = max(tc, pc.cls[i].w);
+            if (i < 3 && pc.cls[i].z > 0.0) foot = 1.0;   // a character class that feeds the Reactive mask
+        }
+        imageStore(chars_out, p, vec4(foot));
         float was = 0.0;
-        if (pc.prev_ok > 0.5) {
+        if (pc.mode.y > 0.5 && pc.mode.z > 0.0) {
             ivec2 q = ivec2(floor(win + mv)), hi = ivec2(pc.size) - 1;
             for (int dy = -1; dy <= 1; dy++)
                 for (int dx = -1; dx <= 1; dx++)
                     was = max(was, imageLoad(chars_prev, clamp(q + ivec2(dx, dy), ivec2(0), hi)).r);
         }
-        rm = max(ch, was) * pc.bias;
+        rm = max(rm, was * pc.mode.z);
     }
-    if (pc.alpha_on > 0.5 && d < 0.999999)
-        rm = max(rm, min(1.0 - texelFetch(alpha_tex, p, 0).r, pc.alpha_cap));
-    if (pc.bias > 0.0 || pc.alpha_on > 0.5) imageStore(mask_out, p, vec4(rm));
+    if (d < 0.999999) {
+        if (pc.alpha.x > 0.5) rm = max(rm, min(1.0 - texelFetch(alpha_tex, p, 0).r, pc.alpha.z));
+        if (pc.alpha.y > 0.5) tc = max(tc, min(1.0 - texelFetch(alpha_tc_tex, p, 0).r, pc.alpha.w));
+    }
+    if (pc.outs.x > 0.5) imageStore(mask_out, p, vec4(rm));
+    if (pc.outs.y > 0.5) imageStore(tc_out, p, vec4(tc));
 }
