@@ -61,31 +61,43 @@ no real source is left out and the log says so.
 | Colour, depth, jitter, reset, render and presentation size, camera near/far/fov, frame time | used | As above. |
 | Motion vectors | used | The camera's reprojection from depth (`dlaa_mv.comp`) with the per-object draws (`dlaa_objmv`, `vk_exec_draw.c`) written over it. |
 | Sharpness | used | `sharpness` from the `sharpness` setting; `enableSharpening` when it is above 0. |
-| Reactive mask | used | `e->mask`, written by `mv_pass`; contents below. |
-| Transparency and composition mask | **not supplied** | No source for it is implemented. `fd.transparency` stays empty, `vk_ffx_dispatch` hands FSR nothing, and the log says `fsr: transparency and composition mask: not supplied`. The Debug view's input panel says the same. |
+| Reactive mask | used | An R8 image at scene resolution, `e->mask`. It is passed to FSR when the context accepts the resource and `mv_pass` wrote it. Contents are below. |
+| Transparency and composition mask | **not supplied** | No source or image is implemented; `fd.transparency` remains empty. |
 | Exposure | not supplied | `AUTO_EXPOSURE` is set on the context. |
 
-## What goes into which mask
+## What goes into each mask
 
-The FSR guide gives each mask its own job, and nothing is put into one that belongs in another.
+### Reactive mask
 
-- **Reactive mask**: where this frame's colour is to count for more than the history because the pixel's colour is not
-  that of a surface that moved with the motion vector. Two things are written into it, the larger of the two per pixel:
-  1. *Alpha of alpha-blended draws* (particles, smoke, sparks): what the guide asks for. The draws are recorded a second
-     time with the game's own shaders into an R8 target and their alpha accumulates there (`alpha_draw`,
-     `vk_alphaobj_execute`, `dlaa_mv.comp`); the value is at most `DLAA_ALPHA_CAP` (0.9). The sky takes none (scene depth at
-     the far plane). Draws it does not take are counted by cause in the log line `vk_exec: reactive mask draws`: blends
-     without an alpha factor (plain additive), line loops, byte indices, indirect draws, draws with
-     storage resources, draws still waiting for their pipeline. Those are not in the mask. `fsr_alpha = 0` turns this off.
-  2. *The characters' class mask*: characters, creatures and what they hold, from the G-buffer's class channel, and where
-     they were the frame before. A character's vector is the camera's only where per-object motion does not reach it, and
-     the guide names drawing such an object into the reactive mask as the way to limit its ghosting. Value `dlss_char_mask`
-     per cent, at most 0.9 for FSR.
-- **Transparency and composition mask**: for areas of special shading that has no motion, such as reflections or animated
-  textures. Nothing in the game's draws has been identified as such a source, so nothing is supplied (see above).
-- **Motion vectors**: motion that comes from a vertex shader (wind in grass, cloth) belongs here, not in a mask. Draws that
-  read no object blocks, terrain and grass among them, are not listed for per-object motion (`mvobj_all = 0`), so their
-  vectors are the camera's. The mask code does not cover for that.
+`dlaa_mv.comp` builds `e->mask` as an R8 image at scene resolution. At each pixel it takes the larger value from:
+
+1. **Qualifying alpha-blended draws.** `alpha_draw` and `vk_alphaobj_execute` replay qualifying draw calls with the game's
+   shaders into an R8 target cleared to 1, depth-tested and with no depth writes. The value is
+   `1 - retained_alpha`, capped at 0.9. It is zero outside covered draw pixels and on the sky (scene depth at the far
+   plane).
+
+   A draw qualifies only when it belongs to the armed light/depth targets, target 0 has blend enabled, and the RGB blend
+   uses either `ONE_MINUS_SRC_ALPHA` for destination alpha coverage or `SRC_ALPHA`/`ONE` for alpha-scaled ADD coverage.
+   It must also have a usable, non-multisample pipeline, enabled depth test, disabled depth writes, and no feedback or
+   storage resources. Plain additive blends, indirect and byte-index draws, line loops, and unbuilt pipelines are omitted.
+   `TOTK_FSR_ALPHA=0` disables this source. The log line `vk_exec: reactive mask draws` reports omitted draws by cause.
+
+2. **Characters and their previous-frame footprint.** Target 0 of the G-buffer carries object classes in green. A pixel
+   whose green value is greater than `64/255` is a character, creature, or held item. It gets
+   `TOTK_DLSS_CHAR_MASK` percent, default 65% and capped at 90% for FSR.
+
+   The pass also marks a 3x3 area around the pixel's previous-frame position when that position belonged to a character.
+   This covers the footprint of a character whose motion vector is only the camera's. The two character sources in one
+   frame are already combined into one binary footprint; this footprint and the alpha source are then combined as a
+   per-pixel maximum. `TOTK_DLSS_CHAR_MASK=0` disables the character source.
+
+No character or alpha source means `e->mask` is not written and FSR receives no reactive resource for that dispatch.
+
+### Transparency and composition mask
+
+**Not supplied.** The code does not create or identify a T&C image, and no source detects reflections, animated textures,
+or other specialist shading. `fd.transparency` stays empty. If FSR's context lists T&C as usable, FSR receives no image
+for this input.
 
 ## Rule: no stand-ins
 
